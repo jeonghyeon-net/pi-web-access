@@ -1,5 +1,6 @@
 import http, { type IncomingMessage, type ServerResponse } from "node:http";
 import { generateCuratorPage } from "./curator-page.js";
+import type { SummaryMeta } from "./summary-review.js";
 
 const STALE_THRESHOLD_MS = 30000;
 const WATCHDOG_INTERVAL_MS = 5000;
@@ -13,21 +14,34 @@ export interface CuratorServerOptions {
 	timeout: number;
 	availableProviders: { perplexity: boolean; exa: boolean; gemini: boolean };
 	defaultProvider: string;
+	summaryModels: Array<{ value: string; label: string }>;
+	defaultSummaryModel: string | null;
 }
 
 export interface CuratorServerCallbacks {
-	onSubmit: (selectedQueryIndices: number[]) => void;
+	onSubmit: (payload: { selectedQueryIndices: number[]; summary?: string; summaryMeta?: SummaryMeta; rawResults?: boolean }) => void;
 	onCancel: (reason: "user" | "timeout" | "stale") => void;
 	onProviderChange: (provider: string) => void;
-	onAddSearch: (query: string, queryIndex: number) => Promise<{ answer: string; results: Array<{ title: string; url: string; domain: string }> }>;
+	onAddSearch: (query: string, queryIndex: number, provider?: string) => Promise<{
+		answer: string;
+		results: Array<{ title: string; url: string; domain: string }>;
+		provider: string;
+	}>;
+	onSummarize: (
+		selectedQueryIndices: number[],
+		signal: AbortSignal,
+		model?: string,
+		feedback?: string,
+	) => Promise<{ summary: string; meta: SummaryMeta }>;
+	onRewriteQuery: (query: string, signal: AbortSignal) => Promise<string>;
 }
 
 export interface CuratorServerHandle {
 	server: http.Server;
 	url: string;
 	close: () => void;
-	pushResult: (queryIndex: number, data: { answer: string; results: Array<{ title: string; url: string; domain: string }> }) => void;
-	pushError: (queryIndex: number, error: string) => void;
+	pushResult: (queryIndex: number, data: { answer: string; results: Array<{ title: string; url: string; domain: string }>; provider: string }) => void;
+	pushError: (queryIndex: number, error: string, provider?: string) => void;
 	searchesDone: () => void;
 }
 
@@ -53,18 +67,108 @@ function parseJSONBody(req: IncomingMessage): Promise<unknown> {
 			body += chunk.toString();
 		});
 		req.on("end", () => {
-			try { resolve(JSON.parse(body)); }
-			catch { reject(new Error("Invalid JSON")); }
+			try {
+				resolve(JSON.parse(body));
+			} catch (err) {
+				const message = err instanceof Error ? err.message : String(err);
+				reject(new Error(`Invalid JSON: ${message}`));
+			}
 		});
 		req.on("error", reject);
 	});
+}
+
+async function parseBodyOrSend(req: IncomingMessage, res: ServerResponse): Promise<unknown | null> {
+	try {
+		return await parseJSONBody(req);
+	} catch (err) {
+		const message = err instanceof Error ? err.message : "Invalid body";
+		const status = message === "Request body too large" ? 413 : 400;
+		sendJson(res, status, { ok: false, error: message });
+		return null;
+	}
+}
+
+function normalizeSelectedIndices(
+	value: unknown,
+	options: { allowEmpty: boolean; maxExclusive: number },
+): { ok: true; indices: number[] } | { ok: false; error: string } {
+	if (!Array.isArray(value)) {
+		return { ok: false, error: "Invalid selection" };
+	}
+
+	if (!options.allowEmpty && value.length === 0) {
+		return { ok: false, error: "Invalid selection" };
+	}
+
+	const normalized: number[] = [];
+	const seen = new Set<number>();
+	for (const item of value) {
+		if (typeof item !== "number" || !Number.isInteger(item) || item < 0) {
+			return { ok: false, error: "Invalid selection" };
+		}
+		if (item >= options.maxExclusive) {
+			return { ok: false, error: "Invalid selection" };
+		}
+		if (seen.has(item)) {
+			continue;
+		}
+		seen.add(item);
+		normalized.push(item);
+	}
+
+	if (!options.allowEmpty && normalized.length === 0) {
+		return { ok: false, error: "Invalid selection" };
+	}
+
+	return { ok: true, indices: normalized };
+}
+
+function normalizeSummaryMeta(value: unknown): SummaryMeta | null {
+	if (!value || typeof value !== "object") return null;
+	const meta = value as Record<string, unknown>;
+
+	const model = meta.model;
+	if (model !== null && typeof model !== "string") return null;
+
+	const durationMs = meta.durationMs;
+	if (typeof durationMs !== "number" || !Number.isFinite(durationMs) || durationMs < 0) return null;
+
+	const tokenEstimate = meta.tokenEstimate;
+	if (typeof tokenEstimate !== "number" || !Number.isFinite(tokenEstimate) || tokenEstimate < 0) return null;
+
+	const fallbackUsed = meta.fallbackUsed;
+	if (typeof fallbackUsed !== "boolean") return null;
+
+	const fallbackReason = meta.fallbackReason;
+	if (fallbackReason !== undefined && typeof fallbackReason !== "string") return null;
+
+	const edited = meta.edited;
+	if (edited !== undefined && typeof edited !== "boolean") return null;
+
+	return {
+		model,
+		durationMs,
+		tokenEstimate,
+		fallbackUsed,
+		fallbackReason,
+		edited,
+	};
 }
 
 export function startCuratorServer(
 	options: CuratorServerOptions,
 	callbacks: CuratorServerCallbacks,
 ): Promise<CuratorServerHandle> {
-	const { queries, sessionToken, timeout, availableProviders, defaultProvider } = options;
+	const {
+		queries,
+		sessionToken,
+		timeout,
+		availableProviders,
+		defaultProvider,
+		summaryModels,
+		defaultSummaryModel,
+	} = options;
 	let browserConnected = false;
 	let lastHeartbeatAt = Date.now();
 	let completed = false;
@@ -73,15 +177,30 @@ export function startCuratorServer(
 	let sseResponse: ServerResponse | null = null;
 	const sseBuffer: string[] = [];
 	let nextQueryIndex = queries.length;
+	let summarizeAbortController: AbortController | null = null;
+	let summarizeRequestSeq = 0;
 
 	let sseKeepalive: NodeJS.Timeout | null = null;
+
+	const abortInFlightSummarize = (): void => {
+		if (!summarizeAbortController) return;
+		summarizeAbortController.abort();
+		summarizeAbortController = null;
+	};
 
 	const markCompleted = (): boolean => {
 		if (completed) return false;
 		completed = true;
 		state = "COMPLETED";
-		if (watchdog) { clearInterval(watchdog); watchdog = null; }
-		if (sseKeepalive) { clearInterval(sseKeepalive); sseKeepalive = null; }
+		if (watchdog) {
+			clearInterval(watchdog);
+			watchdog = null;
+		}
+		if (sseKeepalive) {
+			clearInterval(sseKeepalive);
+			sseKeepalive = null;
+		}
+		abortInFlightSummarize();
 		if (sseResponse) {
 			try { sseResponse.end(); } catch {}
 			sseResponse = null;
@@ -106,22 +225,31 @@ export function startCuratorServer(
 		return true;
 	}
 
+	function isAvailableProvider(provider: string): boolean {
+		if (provider === "perplexity") return availableProviders.perplexity;
+		if (provider === "exa") return availableProviders.exa;
+		if (provider === "gemini") return availableProviders.gemini;
+		return false;
+	}
+
 	function sendSSE(event: string, data: unknown): void {
 		const payload = `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
 		const res = sseResponse;
 		if (res && !res.writableEnded && res.socket && !res.socket.destroyed) {
-			try {
-				const ok = res.write(payload);
-				if (!ok) res.once("drain", () => {});
-			} catch {
-				sseBuffer.push(payload);
-			}
-		} else {
-			sseBuffer.push(payload);
+			try { res.write(payload); return; } catch {}
 		}
+		sseBuffer.push(payload);
 	}
 
-	const pageHtml = generateCuratorPage(queries, sessionToken, timeout, availableProviders, defaultProvider);
+	const pageHtml = generateCuratorPage(
+		queries,
+		sessionToken,
+		timeout,
+		availableProviders,
+		defaultProvider,
+		summaryModels,
+		defaultSummaryModel,
+	);
 
 	const server = http.createServer(async (req, res) => {
 		try {
@@ -161,16 +289,24 @@ export function startCuratorServer(
 				res.writeHead(200, {
 					"Content-Type": "text/event-stream",
 					"Cache-Control": "no-cache",
-					"Connection": "keep-alive",
+					Connection: "keep-alive",
 					"X-Accel-Buffering": "no",
 				});
 				res.flushHeaders();
 				if (res.socket) res.socket.setNoDelay(true);
 				sseResponse = res;
-				for (const msg of sseBuffer) {
-					try { res.write(msg); } catch {}
+				if (sseBuffer.length > 0) {
+					const pending = sseBuffer.splice(0, sseBuffer.length);
+					for (let i = 0; i < pending.length; i++) {
+						const msg = pending[i];
+						try {
+							res.write(msg);
+						} catch {
+							sseBuffer.unshift(...pending.slice(i));
+							break;
+						}
+					}
 				}
-				sseBuffer.length = 0;
 				if (sseKeepalive) clearInterval(sseKeepalive);
 				sseKeepalive = setInterval(() => {
 					if (sseResponse) {
@@ -184,8 +320,8 @@ export function startCuratorServer(
 			}
 
 			if (method === "POST" && url.pathname === "/heartbeat") {
-				const body = await parseJSONBody(req).catch(() => null);
-				if (!body) { sendJson(res, 400, { ok: false, error: "Invalid body" }); return; }
+				const body = await parseBodyOrSend(req, res);
+				if (!body) return;
 				if (!validateToken(body, res)) return;
 				touchHeartbeat();
 				sendJson(res, 200, { ok: true });
@@ -193,51 +329,194 @@ export function startCuratorServer(
 			}
 
 			if (method === "POST" && url.pathname === "/provider") {
-				const body = await parseJSONBody(req).catch(() => null);
-				if (!body) { sendJson(res, 400, { ok: false, error: "Invalid body" }); return; }
+				const body = await parseBodyOrSend(req, res);
+				if (!body) return;
 				if (!validateToken(body, res)) return;
 				const { provider } = body as { provider?: string };
-				if (typeof provider === "string" && provider.length > 0) {
-					setImmediate(() => callbacks.onProviderChange(provider));
+				if (typeof provider !== "string" || provider.length === 0) {
+					sendJson(res, 400, { ok: false, error: "Invalid provider" });
+					return;
 				}
+				if (!isAvailableProvider(provider)) {
+					sendJson(res, 400, { ok: false, error: `Provider unavailable: ${provider}` });
+					return;
+				}
+				setImmediate(() => callbacks.onProviderChange(provider));
 				sendJson(res, 200, { ok: true });
 				return;
 			}
 
 			if (method === "POST" && url.pathname === "/search") {
-				const body = await parseJSONBody(req).catch(() => null);
-				if (!body) { sendJson(res, 400, { ok: false, error: "Invalid body" }); return; }
+				const body = await parseBodyOrSend(req, res);
+				if (!body) return;
 				if (!validateToken(body, res)) return;
 				if (state === "COMPLETED") {
 					sendJson(res, 409, { ok: false, error: "Session closed" });
 					return;
 				}
-				const { query } = body as { query?: string };
+				const { query, provider } = body as { query?: string; provider?: string };
 				if (typeof query !== "string" || query.trim().length === 0) {
 					sendJson(res, 400, { ok: false, error: "Invalid query" });
 					return;
 				}
+				if (provider !== undefined) {
+					if (typeof provider !== "string" || provider.length === 0) {
+						sendJson(res, 400, { ok: false, error: "Invalid provider" });
+						return;
+					}
+					if (!isAvailableProvider(provider)) {
+						sendJson(res, 400, { ok: false, error: `Provider unavailable: ${provider}` });
+						return;
+					}
+				}
 				const qi = nextQueryIndex++;
 				touchHeartbeat();
 				try {
-					const result = await callbacks.onAddSearch(query.trim(), qi);
-					sendJson(res, 200, { ok: true, queryIndex: qi, answer: result.answer, results: result.results });
+					const result = await callbacks.onAddSearch(query.trim(), qi, provider);
+					sendJson(res, 200, {
+						ok: true,
+						queryIndex: qi,
+						answer: result.answer,
+						results: result.results,
+						provider: result.provider,
+					});
 				} catch (err) {
 					const message = err instanceof Error ? err.message : "Search failed";
-					sendJson(res, 200, { ok: true, queryIndex: qi, error: message });
+					sendJson(res, 200, {
+						ok: true,
+						queryIndex: qi,
+						error: message,
+						provider: typeof provider === "string" && provider.length > 0 ? provider : undefined,
+					});
+				}
+				return;
+			}
+
+			if (method === "POST" && url.pathname === "/summarize") {
+				const body = await parseBodyOrSend(req, res);
+				if (!body) return;
+				if (!validateToken(body, res)) return;
+				if (state === "COMPLETED") {
+					sendJson(res, 409, { ok: false, error: "Session closed" });
+					return;
+				}
+
+				const parsed = normalizeSelectedIndices((body as { selected?: unknown }).selected, {
+					allowEmpty: false,
+					maxExclusive: nextQueryIndex,
+				});
+				if (!parsed.ok) {
+					sendJson(res, 400, { ok: false, error: parsed.error });
+					return;
+				}
+
+				let model: string | undefined;
+				const bodyModel = (body as { model?: unknown }).model;
+				if (bodyModel !== undefined) {
+					if (typeof bodyModel !== "string") {
+						sendJson(res, 400, { ok: false, error: "Invalid model" });
+						return;
+					}
+					const trimmedModel = bodyModel.trim();
+					model = trimmedModel.length > 0 ? trimmedModel : undefined;
+				}
+
+				const bodyFeedback = (body as { feedback?: unknown }).feedback;
+				const feedback = typeof bodyFeedback === "string" && bodyFeedback.trim().length > 0
+					? bodyFeedback.trim()
+					: undefined;
+
+				abortInFlightSummarize();
+				const controller = new AbortController();
+				summarizeAbortController = controller;
+				const requestId = ++summarizeRequestSeq;
+
+				try {
+					const result = await callbacks.onSummarize(parsed.indices, controller.signal, model, feedback);
+					if (requestId !== summarizeRequestSeq || state === "COMPLETED") {
+						sendJson(res, 409, { ok: false, error: "Summarize request superseded" });
+						return;
+					}
+					sendJson(res, 200, {
+						ok: true,
+						summary: result.summary,
+						meta: result.meta,
+					});
+				} catch (err) {
+					const message = err instanceof Error ? err.message : "Summary generation failed";
+					const status = controller.signal.aborted ? 409 : 500;
+					sendJson(res, status, { ok: false, error: message });
+				} finally {
+					if (summarizeAbortController === controller) {
+						summarizeAbortController = null;
+					}
+				}
+				return;
+			}
+
+			if (method === "POST" && url.pathname === "/rewrite") {
+				const body = await parseBodyOrSend(req, res);
+				if (!body) return;
+				if (!validateToken(body, res)) return;
+				if (state === "COMPLETED") {
+					sendJson(res, 409, { ok: false, error: "Session closed" });
+					return;
+				}
+				const { query } = body as { query?: unknown };
+				if (typeof query !== "string" || query.trim().length === 0) {
+					sendJson(res, 400, { ok: false, error: "Invalid query" });
+					return;
+				}
+				const controller = new AbortController();
+				req.on("close", () => controller.abort());
+				touchHeartbeat();
+				try {
+					const rewritten = await callbacks.onRewriteQuery(query.trim(), controller.signal);
+					sendJson(res, 200, { ok: true, query: rewritten });
+				} catch (err) {
+					const message = err instanceof Error ? err.message : "Rewrite failed";
+					const status = controller.signal.aborted ? 409 : 500;
+					sendJson(res, status, { ok: false, error: message });
 				}
 				return;
 			}
 
 			if (method === "POST" && url.pathname === "/submit") {
-				const body = await parseJSONBody(req).catch(() => null);
-				if (!body) { sendJson(res, 400, { ok: false, error: "Invalid body" }); return; }
+				const body = await parseBodyOrSend(req, res);
+				if (!body) return;
 				if (!validateToken(body, res)) return;
-				const { selected } = body as { selected?: number[] };
-				if (!Array.isArray(selected) || !selected.every(n => typeof n === "number")) {
-					sendJson(res, 400, { ok: false, error: "Invalid selection" });
+
+				const parsed = normalizeSelectedIndices((body as { selected?: unknown }).selected, {
+					allowEmpty: true,
+					maxExclusive: nextQueryIndex,
+				});
+				if (!parsed.ok) {
+					sendJson(res, 400, { ok: false, error: parsed.error });
 					return;
 				}
+
+				let summary: string | undefined;
+				const bodySummary = (body as { summary?: unknown }).summary;
+				if (bodySummary !== undefined) {
+					if (typeof bodySummary !== "string") {
+						sendJson(res, 400, { ok: false, error: "Invalid summary" });
+						return;
+					}
+					const trimmedSummary = bodySummary.trim();
+					summary = trimmedSummary.length > 0 ? trimmedSummary : undefined;
+				}
+
+				let summaryMeta: SummaryMeta | undefined;
+				const bodySummaryMeta = (body as { summaryMeta?: unknown }).summaryMeta;
+				if (bodySummaryMeta !== undefined) {
+					const parsedSummaryMeta = normalizeSummaryMeta(bodySummaryMeta);
+					if (!parsedSummaryMeta) {
+						sendJson(res, 400, { ok: false, error: "Invalid summaryMeta" });
+						return;
+					}
+					summaryMeta = parsedSummaryMeta;
+				}
+
 				if (state !== "SEARCHING" && state !== "RESULT_SELECTION") {
 					sendJson(res, 409, { ok: false, error: "Cannot submit in current state" });
 					return;
@@ -246,14 +525,15 @@ export function startCuratorServer(
 					sendJson(res, 409, { ok: false, error: "Session closed" });
 					return;
 				}
+				const rawResults = (body as { rawResults?: unknown }).rawResults === true;
 				sendJson(res, 200, { ok: true });
-				setImmediate(() => callbacks.onSubmit(selected));
+				setImmediate(() => callbacks.onSubmit({ selectedQueryIndices: parsed.indices, summary, summaryMeta, rawResults }));
 				return;
 			}
 
 			if (method === "POST" && url.pathname === "/cancel") {
-				const body = await parseJSONBody(req).catch(() => null);
-				if (!body) { sendJson(res, 400, { ok: false, error: "Invalid body" }); return; }
+				const body = await parseBodyOrSend(req, res);
+				if (!body) return;
 				if (!validateToken(body, res)) return;
 				if (!markCompleted()) {
 					sendJson(res, 200, { ok: true });
@@ -310,9 +590,9 @@ export function startCuratorServer(
 					if (completed) return;
 					sendSSE("result", { queryIndex, query: queries[queryIndex] ?? "", ...data });
 				},
-				pushError: (queryIndex, error) => {
+				pushError: (queryIndex, error, provider) => {
 					if (completed) return;
-					sendSSE("search-error", { queryIndex, query: queries[queryIndex] ?? "", error });
+					sendSSE("search-error", { queryIndex, query: queries[queryIndex] ?? "", error, provider });
 				},
 				searchesDone: () => {
 					if (completed) return;

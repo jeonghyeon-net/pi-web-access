@@ -34,31 +34,37 @@ export interface SearchOptions {
 }
 
 interface WebSearchConfig {
-	perplexityApiKey?: string;
+	perplexityApiKey?: unknown;
 }
 
 let cachedConfig: WebSearchConfig | null = null;
 
 function loadConfig(): WebSearchConfig {
 	if (cachedConfig) return cachedConfig;
-	
-	if (existsSync(CONFIG_PATH)) {
-		try {
-			const content = readFileSync(CONFIG_PATH, "utf-8");
-			cachedConfig = JSON.parse(content) as WebSearchConfig;
-			return cachedConfig;
-		} catch {
-			cachedConfig = {};
-		}
-	} else {
+	if (!existsSync(CONFIG_PATH)) {
 		cachedConfig = {};
+		return cachedConfig;
 	}
-	return cachedConfig;
+
+	const content = readFileSync(CONFIG_PATH, "utf-8");
+	try {
+		cachedConfig = JSON.parse(content) as WebSearchConfig;
+		return cachedConfig;
+	} catch (err) {
+		const message = err instanceof Error ? err.message : String(err);
+		throw new Error(`Failed to parse ${CONFIG_PATH}: ${message}`);
+	}
+}
+
+function normalizeApiKey(value: unknown): string | null {
+	if (typeof value !== "string") return null;
+	const normalized = value.trim();
+	return normalized.length > 0 ? normalized : null;
 }
 
 function getApiKey(): string {
 	const config = loadConfig();
-	const key = process.env.PERPLEXITY_API_KEY || config.perplexityApiKey;
+	const key = normalizeApiKey(process.env.PERPLEXITY_API_KEY) ?? normalizeApiKey(config.perplexityApiKey);
 	if (!key) {
 		throw new Error(
 			"Perplexity API key not found. Either:\n" +
@@ -95,7 +101,7 @@ function validateDomainFilter(domains: string[]): string[] {
 
 export function isPerplexityAvailable(): boolean {
 	const config = loadConfig();
-	return Boolean(process.env.PERPLEXITY_API_KEY || config.perplexityApiKey);
+	return !!(normalizeApiKey(process.env.PERPLEXITY_API_KEY) ?? normalizeApiKey(config.perplexityApiKey));
 }
 
 export async function searchWithPerplexity(query: string, options: SearchOptions = {}): Promise<SearchResponse> {
@@ -161,9 +167,10 @@ export async function searchWithPerplexity(query: string, options: SearchOptions
 	let data: Record<string, unknown>;
 	try {
 		data = await response.json();
-	} catch {
+	} catch (err) {
 		activityMonitor.logComplete(activityId, response.status);
-		throw new Error("Perplexity API returned invalid JSON");
+		const message = err instanceof Error ? err.message : String(err);
+		throw new Error(`Perplexity API returned invalid JSON: ${message}`);
 	}
 
 	const answer = (data.choices as Array<{ message?: { content?: string } }>)?.[0]?.message?.content || "";

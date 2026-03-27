@@ -15,7 +15,7 @@ const MONTHLY_LIMIT = 1000;
 const WARNING_THRESHOLD = 800;
 
 interface WebSearchConfig {
-	exaApiKey?: string;
+	exaApiKey?: unknown;
 }
 
 interface ExaUsage {
@@ -64,18 +64,29 @@ let warnedMonth: string | null = null;
 
 function loadConfig(): WebSearchConfig {
 	if (cachedConfig) return cachedConfig;
-	if (existsSync(CONFIG_PATH)) {
-		try {
-			cachedConfig = JSON.parse(readFileSync(CONFIG_PATH, "utf-8")) as WebSearchConfig;
-			return cachedConfig;
-		} catch {}
+	if (!existsSync(CONFIG_PATH)) {
+		cachedConfig = {};
+		return cachedConfig;
 	}
-	cachedConfig = {};
-	return cachedConfig;
+
+	const raw = readFileSync(CONFIG_PATH, "utf-8");
+	try {
+		cachedConfig = JSON.parse(raw) as WebSearchConfig;
+		return cachedConfig;
+	} catch (err) {
+		const message = err instanceof Error ? err.message : String(err);
+		throw new Error(`Failed to parse ${CONFIG_PATH}: ${message}`);
+	}
+}
+
+function normalizeApiKey(value: unknown): string | null {
+	if (typeof value !== "string") return null;
+	const normalized = value.trim();
+	return normalized.length > 0 ? normalized : null;
 }
 
 function getApiKey(): string | null {
-	return process.env.EXA_API_KEY || loadConfig().exaApiKey || null;
+	return normalizeApiKey(process.env.EXA_API_KEY) ?? normalizeApiKey(loadConfig().exaApiKey);
 }
 
 function getCurrentMonth(): string {
@@ -94,19 +105,19 @@ function normalizeUsage(raw: unknown): ExaUsage {
 
 function readUsage(): ExaUsage {
 	if (!existsSync(USAGE_PATH)) return { month: getCurrentMonth(), count: 0 };
+	const raw = readFileSync(USAGE_PATH, "utf-8");
 	try {
-		return normalizeUsage(JSON.parse(readFileSync(USAGE_PATH, "utf-8")));
-	} catch {
-		return { month: getCurrentMonth(), count: 0 };
+		return normalizeUsage(JSON.parse(raw));
+	} catch (err) {
+		const message = err instanceof Error ? err.message : String(err);
+		throw new Error(`Failed to parse ${USAGE_PATH}: ${message}`);
 	}
 }
 
 function writeUsage(usage: ExaUsage): void {
-	try {
-		const dir = join(homedir(), ".pi");
-		if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
-		writeFileSync(USAGE_PATH, JSON.stringify(usage, null, 2) + "\n");
-	} catch {}
+	const dir = join(homedir(), ".pi");
+	if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+	writeFileSync(USAGE_PATH, JSON.stringify(usage, null, 2) + "\n");
 }
 
 function reserveRequestBudget(): { exhausted: true } | null {
@@ -145,8 +156,13 @@ function recencyToStartDate(filter: string): string {
 
 function mapDomainFilter(domainFilter: string[] | undefined): { includeDomains?: string[]; excludeDomains?: string[] } {
 	if (!domainFilter?.length) return {};
-	const includeDomains = domainFilter.filter(d => !d.startsWith("-"));
-	const excludeDomains = domainFilter.filter(d => d.startsWith("-")).map(d => d.slice(1)).filter(Boolean);
+	const includeDomains = domainFilter
+		.filter(d => !d.startsWith("-") && d.trim().length > 0)
+		.map(d => d.trim());
+	const excludeDomains = domainFilter
+		.filter(d => d.startsWith("-"))
+		.map(d => d.slice(1).trim())
+		.filter(Boolean);
 	return {
 		...(includeDomains.length ? { includeDomains } : {}),
 		...(excludeDomains.length ? { excludeDomains } : {}),
@@ -242,7 +258,8 @@ export async function callExaMcp(
 				parsed = candidate;
 				break;
 			}
-		} catch {}
+		} catch {
+		}
 	}
 
 	if (!parsed) {
@@ -251,7 +268,8 @@ export async function callExaMcp(
 			if (candidate?.result || candidate?.error) {
 				parsed = candidate;
 			}
-		} catch {}
+		} catch {
+		}
 	}
 
 	if (!parsed) {
@@ -317,15 +335,37 @@ function mapMcpInlineContent(results: McpParsedResult[]): ExtractedContent[] {
 		}));
 }
 
+function buildMcpQuery(query: string, options: ExaSearchOptions): string {
+	const parts = [query];
+	if (options.domainFilter?.length) {
+		for (const d of options.domainFilter) {
+			parts.push(d.startsWith("-") ? `-site:${d.slice(1)}` : `site:${d}`);
+		}
+	}
+	if (options.recencyFilter) {
+		const now = new Date();
+		switch (options.recencyFilter) {
+			case "day": parts.push("past 24 hours"); break;
+			case "week": parts.push("past week"); break;
+			case "month": parts.push(`${now.toLocaleString("en", { month: "long" })} ${now.getFullYear()}`); break;
+			case "year": parts.push(String(now.getFullYear())); break;
+		}
+	}
+	return parts.join(" ");
+}
+
 async function searchWithExaMcp(query: string, options: ExaSearchOptions = {}): Promise<SearchResponse | null> {
-	const activityId = activityMonitor.logStart({ type: "api", query });
+	const enrichedQuery = buildMcpQuery(query, options);
+	const activityId = activityMonitor.logStart({ type: "api", query: enrichedQuery });
 
 	try {
 		const text = await callExaMcp(
 			"web_search_exa",
 			{
-				query,
+				query: enrichedQuery,
 				numResults: options.numResults ?? 5,
+				livecrawl: "fallback",
+				type: "auto",
 				...(options.includeContent ? { contextMaxCharacters: 50000 } : {}),
 			},
 			options.signal,
@@ -376,7 +416,6 @@ export function hasExaApiKey(): boolean {
 export async function searchWithExa(query: string, options: ExaSearchOptions = {}): Promise<ExaSearchResult> {
 	const apiKey = getApiKey();
 	if (!apiKey) {
-		if (options.domainFilter?.length || options.recencyFilter) return null;
 		return searchWithExaMcp(query, options);
 	}
 

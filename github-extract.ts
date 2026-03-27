@@ -1,7 +1,7 @@
-import { existsSync, readFileSync, rmSync, statSync, readdirSync, openSync, readSync, closeSync } from "node:fs";
+import { existsSync, readFileSync, rmSync, statSync, readdirSync, openSync, readSync, closeSync, realpathSync } from "node:fs";
 import { execFile } from "node:child_process";
 import { homedir } from "node:os";
-import { join, extname } from "node:path";
+import { extname, join, resolve as resolvePath, sep as pathSep } from "node:path";
 import { activityMonitor } from "./activity.js";
 import type { ExtractedContent } from "./extract.js";
 import { checkGhAvailable, checkRepoSize, fetchViaApi, showGhHint } from "./github-api.js";
@@ -54,6 +54,21 @@ const cloneCache = new Map<string, CachedClone>();
 
 let cachedConfig: GitHubCloneConfig | null = null;
 
+function normalizeEnabled(value: unknown, fallback: boolean): boolean {
+	return typeof value === "boolean" ? value : fallback;
+}
+
+function normalizePositiveNumber(value: unknown, fallback: number): number {
+	if (typeof value !== "number" || !Number.isFinite(value)) return fallback;
+	return value > 0 ? value : fallback;
+}
+
+function normalizeClonePath(value: unknown, fallback: string): string {
+	if (typeof value !== "string") return fallback;
+	const normalized = value.trim();
+	return normalized.length > 0 ? normalized : fallback;
+}
+
 function loadGitHubConfig(): GitHubCloneConfig {
 	if (cachedConfig) return cachedConfig;
 
@@ -64,23 +79,27 @@ function loadGitHubConfig(): GitHubCloneConfig {
 		clonePath: "/tmp/pi-github-repos",
 	};
 
-	try {
-		if (existsSync(CONFIG_PATH)) {
-			const raw = JSON.parse(readFileSync(CONFIG_PATH, "utf-8"));
-			const gc = raw.githubClone ?? {};
-			cachedConfig = {
-				enabled: gc.enabled ?? defaults.enabled,
-				maxRepoSizeMB: gc.maxRepoSizeMB ?? defaults.maxRepoSizeMB,
-				cloneTimeoutSeconds: gc.cloneTimeoutSeconds ?? defaults.cloneTimeoutSeconds,
-				clonePath: gc.clonePath ?? defaults.clonePath,
-			};
-			return cachedConfig;
-		}
-	} catch {
-		// ignore parse errors
+	if (!existsSync(CONFIG_PATH)) {
+		cachedConfig = defaults;
+		return cachedConfig;
 	}
 
-	cachedConfig = defaults;
+	const rawText = readFileSync(CONFIG_PATH, "utf-8");
+	let raw: { githubClone?: { enabled?: unknown; maxRepoSizeMB?: unknown; cloneTimeoutSeconds?: unknown; clonePath?: unknown } };
+	try {
+		raw = JSON.parse(rawText) as { githubClone?: { enabled?: unknown; maxRepoSizeMB?: unknown; cloneTimeoutSeconds?: unknown; clonePath?: unknown } };
+	} catch (err) {
+		const message = err instanceof Error ? err.message : String(err);
+		throw new Error(`Failed to parse ${CONFIG_PATH}: ${message}`);
+	}
+
+	const gc = raw.githubClone ?? {};
+	cachedConfig = {
+		enabled: normalizeEnabled(gc.enabled, defaults.enabled),
+		maxRepoSizeMB: normalizePositiveNumber(gc.maxRepoSizeMB, defaults.maxRepoSizeMB),
+		cloneTimeoutSeconds: normalizePositiveNumber(gc.cloneTimeoutSeconds, defaults.cloneTimeoutSeconds),
+		clonePath: normalizeClonePath(gc.clonePath, defaults.clonePath),
+	};
 	return cachedConfig;
 }
 
@@ -101,9 +120,19 @@ export function parseGitHubUrl(url: string): GitHubUrlInfo | null {
 		return null;
 	}
 
-	if (parsed.hostname !== "github.com") return null;
+	const host = parsed.hostname.toLowerCase();
+	if (host !== "github.com" && host !== "www.github.com") return null;
 
-	const segments = parsed.pathname.split("/").filter(Boolean);
+	const segments = parsed.pathname
+		.split("/")
+		.filter(Boolean)
+		.map((segment) => {
+			try {
+				return decodeURIComponent(segment);
+			} catch {
+				return segment;
+			}
+		});
 	if (segments.length < 2) return null;
 
 	const owner = segments[0];
@@ -149,7 +178,8 @@ function execClone(args: string[], localPath: string, timeoutMs: number, signal?
 			if (err) {
 				try {
 					rmSync(localPath, { recursive: true, force: true });
-				} catch { /* ignore */ }
+				} catch {
+				}
 				resolve(null);
 				return;
 			}
@@ -175,7 +205,8 @@ async function cloneRepo(
 
 	try {
 		rmSync(localPath, { recursive: true, force: true });
-	} catch { /* ignore */ }
+	} catch {
+	}
 
 	const timeoutMs = config.cloneTimeoutSeconds * 1000;
 	const hasGh = await checkGhAvailable();
@@ -226,6 +257,35 @@ function formatFileSize(bytes: number): string {
 	return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
+function resolveWithinRepo(rootPath: string, relativePath: string): string | null {
+	const normalizedRoot = resolvePath(rootPath);
+	const candidate = resolvePath(normalizedRoot, relativePath);
+	if (candidate !== normalizedRoot) {
+		const rootPrefix = normalizedRoot.endsWith(pathSep) ? normalizedRoot : normalizedRoot + pathSep;
+		if (!candidate.startsWith(rootPrefix)) return null;
+	}
+
+	if (!existsSync(candidate)) return candidate;
+
+	try {
+		const realRoot = realpathSync(normalizedRoot);
+		const realCandidate = realpathSync(candidate);
+		if (realCandidate === realRoot) return candidate;
+		const realRootPrefix = realRoot.endsWith(pathSep) ? realRoot : realRoot + pathSep;
+		return realCandidate.startsWith(realRootPrefix) ? candidate : null;
+	} catch {
+		return null;
+	}
+}
+
+function readTextFile(path: string): string | null {
+	try {
+		return readFileSync(path, "utf-8");
+	} catch {
+		return null;
+	}
+}
+
 function buildTree(rootPath: string): string {
 	const entries: string[] = [];
 
@@ -243,15 +303,19 @@ function buildTree(rootPath: string): string {
 			if (entries.length >= MAX_TREE_ENTRIES) return;
 			if (item === ".git") continue;
 
-			const fullPath = join(dir, item);
-			let stat;
-			try {
-				stat = statSync(fullPath);
-			} catch {
+			const rel = relPath ? `${relPath}/${item}` : item;
+			const safePath = resolveWithinRepo(rootPath, rel);
+			if (!safePath) {
+				entries.push(`${rel}  [outside repo skipped]`);
 				continue;
 			}
 
-			const rel = relPath ? `${relPath}/${item}` : item;
+			let stat;
+			try {
+				stat = statSync(safePath);
+			} catch {
+				continue;
+			}
 
 			if (stat.isDirectory()) {
 				if (NOISE_DIRS.has(item)) {
@@ -259,7 +323,7 @@ function buildTree(rootPath: string): string {
 					continue;
 				}
 				entries.push(`${rel}/`);
-				walk(fullPath, rel);
+				walk(safePath, rel);
 			} else {
 				entries.push(rel);
 			}
@@ -276,7 +340,8 @@ function buildTree(rootPath: string): string {
 }
 
 function buildDirListing(rootPath: string, subPath: string): string {
-	const targetPath = join(rootPath, subPath);
+	const targetPath = resolveWithinRepo(rootPath, subPath);
+	if (!targetPath) return "(path escapes repository root)";
 	const lines: string[] = [];
 
 	let items: string[];
@@ -288,9 +353,14 @@ function buildDirListing(rootPath: string, subPath: string): string {
 
 	for (const item of items) {
 		if (item === ".git") continue;
-		const fullPath = join(targetPath, item);
+		const rel = subPath ? `${subPath}/${item}` : item;
+		const safePath = resolveWithinRepo(rootPath, rel);
+		if (!safePath) {
+			lines.push(`  ${item}  (outside repo)`);
+			continue;
+		}
 		try {
-			const stat = statSync(fullPath);
+			const stat = statSync(safePath);
 			if (stat.isDirectory()) {
 				lines.push(`  ${item}/`);
 			} else {
@@ -313,7 +383,7 @@ function readReadme(localPath: string): string | null {
 				const content = readFileSync(readmePath, "utf-8");
 				return content.length > 8192 ? content.slice(0, 8192) + "\n\n[README truncated at 8K chars]" : content;
 			} catch {
-				return null;
+				continue;
 			}
 		}
 	}
@@ -343,9 +413,9 @@ function generateContent(localPath: string, info: GitHubUrlInfo): string {
 
 	if (info.type === "tree") {
 		const dirPath = info.path || "";
-		const fullDirPath = join(localPath, dirPath);
+		const fullDirPath = resolveWithinRepo(localPath, dirPath);
 
-		if (!existsSync(fullDirPath)) {
+		if (!fullDirPath || !existsSync(fullDirPath)) {
 			lines.push(`Path \`${dirPath}\` not found in clone. Showing repository root instead.`);
 			lines.push("");
 			lines.push("## Structure");
@@ -362,9 +432,9 @@ function generateContent(localPath: string, info: GitHubUrlInfo): string {
 
 	if (info.type === "blob") {
 		const filePath = info.path || "";
-		const fullFilePath = join(localPath, filePath);
+		const fullFilePath = resolveWithinRepo(localPath, filePath);
 
-		if (!existsSync(fullFilePath)) {
+		if (!fullFilePath || !existsSync(fullFilePath)) {
 			lines.push(`Path \`${filePath}\` not found in clone. Showing repository root instead.`);
 			lines.push("");
 			lines.push("## Structure");
@@ -374,7 +444,16 @@ function generateContent(localPath: string, info: GitHubUrlInfo): string {
 			return lines.join("\n");
 		}
 
-		const stat = statSync(fullFilePath);
+		let stat: ReturnType<typeof statSync>;
+		try {
+			stat = statSync(fullFilePath);
+		} catch (err) {
+			const message = err instanceof Error ? err.message : String(err);
+			lines.push(`Could not inspect \`${filePath}\`: ${message}`);
+			lines.push("");
+			lines.push("Use `read` and `bash` tools at the path above to explore further.");
+			return lines.join("\n");
+		}
 
 		if (stat.isDirectory()) {
 			lines.push(`## ${filePath || "/"}`);
@@ -391,7 +470,13 @@ function generateContent(localPath: string, info: GitHubUrlInfo): string {
 			return lines.join("\n");
 		}
 
-		const content = readFileSync(fullFilePath, "utf-8");
+		const content = readTextFile(fullFilePath);
+		if (content === null) {
+			lines.push(`Could not read \`${filePath}\` as UTF-8 text.`);
+			lines.push("");
+			lines.push("Use `read` and `bash` tools at the path above to explore further.");
+			return lines.join("\n");
+		}
 		lines.push(`## ${filePath}`);
 
 		if (content.length > MAX_INLINE_FILE_CHARS) {
@@ -418,9 +503,9 @@ async function awaitCachedClone(
 	info: GitHubUrlInfo,
 	signal?: AbortSignal,
 ): Promise<ExtractedContent | null> {
-	if (signal?.aborted) return fetchViaApi(url, owner, repo, info);
+	if (signal?.aborted) return null;
 	const result = await cached.clonePromise;
-	if (signal?.aborted) return fetchViaApi(url, owner, repo, info);
+	if (signal?.aborted) return null;
 	if (result) {
 		const content = generateContent(result, info);
 		const title = info.path ? `${owner}/${repo} - ${info.path}` : `${owner}/${repo}`;
@@ -437,6 +522,8 @@ export async function extractGitHub(
 	const info = parseGitHubUrl(url);
 	if (!info) return null;
 
+	if (signal?.aborted) return null;
+
 	const config = loadGitHubConfig();
 	if (!config.enabled) return null;
 
@@ -447,6 +534,7 @@ export async function extractGitHub(
 	if (cached) return awaitCachedClone(cached, url, owner, repo, info, signal);
 
 	if (info.refIsFullSha) {
+		if (signal?.aborted) return null;
 		const sizeNote = `Note: Commit SHA URLs use the GitHub API instead of cloning.`;
 		return fetchViaApi(url, owner, repo, info, sizeNote);
 	}
@@ -455,36 +543,76 @@ export async function extractGitHub(
 
 	if (!forceClone) {
 		const sizeKB = await checkRepoSize(owner, repo);
+		if (signal?.aborted) {
+			activityMonitor.logComplete(activityId, 0);
+			return null;
+		}
 		if (sizeKB !== null) {
 			const sizeMB = sizeKB / 1024;
 			if (sizeMB > config.maxRepoSizeMB) {
-				activityMonitor.logComplete(activityId, 200);
+				if (signal?.aborted) {
+					activityMonitor.logComplete(activityId, 0);
+					return null;
+				}
 				const sizeNote =
 					`Note: Repository is ${Math.round(sizeMB)}MB (threshold: ${config.maxRepoSizeMB}MB). ` +
 					`Showing API-fetched content instead of full clone. Ask the user if they'd like to clone the full repo -- ` +
 					`if yes, call fetch_content again with the same URL and add forceClone: true to the params.`;
-				return fetchViaApi(url, owner, repo, info, sizeNote);
+				const apiView = await fetchViaApi(url, owner, repo, info, sizeNote);
+				if (apiView) {
+					activityMonitor.logComplete(activityId, 200);
+					return apiView;
+				}
+				activityMonitor.logError(activityId, "api fallback unavailable for oversized repository");
+				return null;
 			}
 		}
 	}
 
+	if (signal?.aborted) {
+		activityMonitor.logComplete(activityId, 0);
+		return null;
+	}
+
 	// Re-check: another concurrent caller may have started a clone while we awaited the size check
 	const cachedAfterSizeCheck = cloneCache.get(key);
-	if (cachedAfterSizeCheck) return awaitCachedClone(cachedAfterSizeCheck, url, owner, repo, info, signal);
+	if (cachedAfterSizeCheck) {
+		const cachedResult = await awaitCachedClone(cachedAfterSizeCheck, url, owner, repo, info, signal);
+		if (signal?.aborted) {
+			activityMonitor.logComplete(activityId, 0);
+		} else if (cachedResult) {
+			activityMonitor.logComplete(activityId, 200);
+		} else {
+			activityMonitor.logError(activityId, "clone failed");
+		}
+		return cachedResult;
+	}
 
 	const clonePromise = cloneRepo(owner, repo, info.ref, config, signal);
 	const localPath = cloneDir(config, owner, repo, info.ref);
 	cloneCache.set(key, { localPath, clonePromise });
 
 	const result = await clonePromise;
+	if (signal?.aborted) {
+		if (!result) cloneCache.delete(key);
+		activityMonitor.logComplete(activityId, 0);
+		return null;
+	}
 
 	if (!result) {
 		cloneCache.delete(key);
-		activityMonitor.logError(activityId, "clone failed");
+		if (signal?.aborted) {
+			activityMonitor.logComplete(activityId, 0);
+			return null;
+		}
 
 		const apiFallback = await fetchViaApi(url, owner, repo, info);
-		if (apiFallback) return apiFallback;
+		if (apiFallback) {
+			activityMonitor.logComplete(activityId, 200);
+			return apiFallback;
+		}
 
+		activityMonitor.logError(activityId, "clone and API fallback failed");
 		return null;
 	}
 
@@ -498,7 +626,8 @@ export function clearCloneCache(): void {
 	for (const entry of cloneCache.values()) {
 		try {
 			rmSync(entry.localPath, { recursive: true, force: true });
-		} catch { /* ignore */ }
+		} catch {
+		}
 	}
 	cloneCache.clear();
 	cachedConfig = null;

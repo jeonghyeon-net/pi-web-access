@@ -14,11 +14,11 @@ https://github.com/user-attachments/assets/cac6a17a-1eeb-4dde-9818-cdf85d8ea98f
 
 ## Why Pi Web Access
 
-**Zero Config** — Signed into Google in Chrome, Arc, Helium, or Chromium? That's it. The extension reads your browser session cookies to access Gemini directly. No API keys, no setup, no subscriptions.
+**Zero Config** — Works out of the box with Exa MCP (no API key needed). Or sign into Google in Chrome, Arc, Helium, or Chromium for Gemini Web. Add API keys for Exa, Perplexity, or Gemini API for more control.
 
 **Video Understanding** — Point it at a YouTube video or local screen recording and ask questions about what's on screen. Full transcripts, visual descriptions, and frame extraction at exact timestamps.
 
-**Smart Fallbacks** — Every capability has a fallback chain. Search tries Perplexity, then Gemini API, then Gemini Web. YouTube tries Gemini Web, then API, then Perplexity. Blocked pages retry through Jina Reader and Gemini extraction. Something always works.
+**Smart Fallbacks** — Every capability has a fallback chain. Search tries Exa, then Perplexity, then Gemini API, then Gemini Web. YouTube tries Gemini Web, then API, then Perplexity. Blocked pages retry through Jina Reader and Gemini extraction. Something always works.
 
 **GitHub Cloning** — GitHub URLs are cloned locally instead of scraped. The agent gets real file contents and a local path to explore, not rendered HTML.
 
@@ -28,16 +28,17 @@ https://github.com/user-attachments/assets/cac6a17a-1eeb-4dde-9818-cdf85d8ea98f
 pi install npm:pi-web-access
 ```
 
-If you're not signed into a supported Chromium-based browser, or prefer a different provider, add API keys to `~/.pi/web-search.json`:
+Works immediately with no API keys — Exa MCP provides zero-config search. For more providers or direct API access, add keys to `~/.pi/web-search.json`:
 
 ```json
 {
+  "exaApiKey": "exa-...",
   "perplexityApiKey": "pplx-...",
   "geminiApiKey": "AIza..."
 }
 ```
 
-You can configure one or both. In `auto` mode (default), `web_search` tries Perplexity first, then Gemini API, then Gemini Web.
+In `auto` mode (default), `web_search` tries Exa first (direct API if keyed, MCP if not), then Perplexity, then Gemini API, then Gemini Web.
 
 Optional dependencies for video frame extraction:
 
@@ -73,16 +74,17 @@ fetch_content({ url: "/path/to/recording.mp4", prompt: "What error appears on sc
 
 ### web_search
 
-Search the web via Perplexity AI or Gemini. Returns a synthesized answer with source citations.
+Search the web via Exa, Perplexity AI, or Gemini. Returns a synthesized answer with source citations.
 
 ```typescript
 web_search({ query: "rust async programming" })
 web_search({ queries: ["query 1", "query 2"] })
 web_search({ query: "latest news", numResults: 10, recencyFilter: "week" })
 web_search({ query: "...", domainFilter: ["github.com"] })
-web_search({ query: "...", provider: "gemini" })
+web_search({ query: "...", provider: "exa" })
 web_search({ query: "...", includeContent: true })
-web_search({ queries: ["query 1", "query 2"], curate: true })
+web_search({ queries: ["query 1", "query 2"], workflow: "none" })
+web_search({ queries: ["query 1", "query 2"], workflow: "summary-review" })
 ```
 
 | Parameter | Description |
@@ -91,9 +93,23 @@ web_search({ queries: ["query 1", "query 2"], curate: true })
 | `numResults` | Results per query (default: 5, max: 20) |
 | `recencyFilter` | `day`, `week`, `month`, or `year` |
 | `domainFilter` | Limit to domains (prefix with `-` to exclude) |
-| `provider` | `auto` (default), `perplexity`, or `gemini` |
+| `provider` | `auto` (default), `exa`, `perplexity`, or `gemini` |
 | `includeContent` | Fetch full page content from sources in background |
-| `curate` | Hold results for browser review (default: true for multi-query). Press Ctrl+Shift+S to open browser UI, or wait for countdown to auto-condense and send. Set to false to skip both curation and condensation. |
+| `workflow` | `none` (skip curator) or `summary-review` (auto-generate summary draft after search completion, default) |
+
+### code_search
+
+Search for code examples, documentation, and API references via Exa MCP. No API key required.
+
+```typescript
+code_search({ query: "React useEffect cleanup pattern" })
+code_search({ query: "Express middleware error handling", maxTokens: 10000 })
+```
+
+| Parameter | Description |
+|-----------|-------------|
+| `query` | Programming question, API, library, or debugging topic |
+| `maxTokens` | Maximum tokens of context to return (default: 5000, max: 50000) |
 
 ### fetch_content
 
@@ -171,6 +187,9 @@ When Readability fails or returns only a cookie notice, the extension retries vi
 ## How It Works
 
 ```
+web_search(query)
+  → Exa (direct API with key, MCP without) → Perplexity → Gemini API → Gemini Web
+
 fetch_content(url)
   → Video file?  Gemini API (Files API) → Gemini Web
   → GitHub URL?  Clone repo, return file contents + local path
@@ -190,14 +209,27 @@ Bundled research workflow for investigating open-source libraries. Combines GitH
 
 ### /websearch
 
-Open the search curator directly in the browser. Runs searches and lets you review, add, and select results to send back to the agent — no LLM round-trip needed.
+Open the search curator directly. Runs searches and lets you review, add, select results, and approve a summary before it is sent back to the agent — no LLM round-trip needed.
 
 ```
-/websearch                                    # empty page, type your own searches
-/websearch react hooks, next.js caching       # pre-fill with comma-separated queries
+/websearch                                               # empty page, type your own searches
+/websearch react hooks, next.js caching                  # pre-fill with comma-separated queries
 ```
 
-Results get injected into the conversation when you click Send. The agent sees them and can use them immediately.
+Results get injected into the conversation when you approve the summary or click "Send selected results without summary". On timeout, the curator auto-submits and falls back to a deterministic summary if no approved draft is present.
+
+### /curator
+
+Toggle or configure the curator workflow at runtime.
+
+```
+/curator                    # toggle on/off
+/curator on                 # enable curator (summary-review)
+/curator off                # disable curator (raw results only)
+/curator summary-review     # explicit workflow
+```
+
+Persists to `~/.pi/web-search.json` and takes effect on the next `web_search` call. When disabled, `web_search` returns raw results without opening the curator window.
 
 ### /search
 
@@ -225,13 +257,14 @@ All config lives in `~/.pi/web-search.json`. Every field is optional.
 
 ```json
 {
+  "exaApiKey": "exa-...",
   "perplexityApiKey": "pplx-...",
   "geminiApiKey": "AIza...",
-  "provider": "perplexity",
+  "provider": "exa",
   "chromeProfile": "Profile 2",
   "searchModel": "gemini-2.5-flash",
-  "curateWindow": 10,
-  "autoFilter": true,
+  "workflow": "summary-review",
+  "curatorTimeoutSeconds": 20,
   "githubClone": {
     "enabled": true,
     "maxRepoSizeMB": 350,
@@ -254,8 +287,7 @@ All config lives in `~/.pi/web-search.json`. Every field is optional.
 }
 ```
 
-`GEMINI_API_KEY` and `PERPLEXITY_API_KEY` env vars take precedence over config file values. `provider` sets the default search provider: `"perplexity"` or `"gemini"`. This is also updated automatically when you change the provider in the curator UI. `curateWindow` controls how many seconds multi-query searches wait before auto-sending results (default: 10). During the countdown, press Ctrl+Shift+S to open the browser curator. Set to 0 to always send immediately (Ctrl+Shift+S still works during the search itself).
-`chromeProfile` overrides the Chromium profile directory used for Gemini Web cookie lookup. `searchModel` overrides the Gemini API model used by `web_search` without changing URL, YouTube, or video extraction defaults.
+`EXA_API_KEY`, `GEMINI_API_KEY`, and `PERPLEXITY_API_KEY` env vars take precedence over config file values. `provider` sets the default search provider: `"exa"`, `"perplexity"`, or `"gemini"`. This is also updated automatically when you change the provider in the curator UI. `workflow` sets the default curator mode: `"summary-review"` (default, opens curator with auto-generated summary draft) or `"none"` (raw results, no curator). Overridden per-call via the `workflow` parameter on `web_search`, or toggled at runtime with `/curator`. `chromeProfile` overrides the Chromium profile directory used for Gemini Web cookie lookup. `searchModel` overrides the Gemini API model used by `web_search` without changing URL, YouTube, or video extraction defaults. `curatorTimeoutSeconds` controls the initial curator idle timeout (default `20`, max `600`); users can still adjust the timer in the curator UI.
 
 ### Shortcuts
 
@@ -271,32 +303,6 @@ Both shortcuts are configurable via `~/.pi/web-search.json`:
 ```
 
 Values use the same format as pi keybindings (e.g. `ctrl+s`, `ctrl+shift+s`, `alt+r`). Changes take effect on next pi restart.
-
-### Auto-Condense
-
-Multi-query searches are automatically condensed into a deduplicated briefing when the countdown expires without manual curation. A single LLM call receives all search results — enriched with preprocessing analysis (URL overlap, answer similarity, source quality tiers) — and produces a concise synthesis organized by topic. Irrelevant or off-topic results are skipped automatically.
-
-```json
-{
-  "autoFilter": {
-    "enabled": true,
-    "model": "anthropic/claude-haiku-4-5",
-    "prompt": "You are a research assistant..."
-  }
-}
-```
-
-| Field | Description |
-|-------|-------------|
-| `enabled` | `true` to enable, `false` to disable. Omit `autoFilter` entirely to enable with defaults. |
-| `model` | LLM model in `provider/model` format. Uses pi's model registry for auth. Default: `anthropic/claude-haiku-4-5`. |
-| `prompt` | System prompt for the condenser. Should instruct the model to synthesize, deduplicate, and cite sources. Omit to use the built-in prompt. |
-
-Shorthand: `"autoFilter": true` or `"autoFilter": false` for enable/disable without customizing model or prompt.
-
-The model uses pi's model registry, so any configured provider works — including custom gateways, OAuth tokens, and API keys. If the model isn't found in the registry or has no credentials, condensation is silently skipped.
-
-The `web_search` tool also accepts an optional `context` parameter — a brief description of the user's current task or goal. When provided, the condenser uses it to focus the briefing (e.g., "building a Shopify checkout extension" helps it emphasize relevant findings over general noise).
 
 Set `"enabled": false` under any feature to disable it. Config changes require a Pi restart.
 
@@ -319,9 +325,11 @@ Rate limits: Perplexity is capped at 10 requests/minute (client-side). Content f
 | `index.ts` | Extension entry, tool definitions, commands, widget |
 | `curator-page.ts` | HTML/CSS/JS generation for the curator UI with markdown rendering |
 | `curator-server.ts` | Ephemeral HTTP server with SSE streaming and state machine |
-| `search-filter.ts` | Auto-condense pipeline — preprocessing, LLM condensation, and post-processing for multi-query results |
+| `summary-review.ts` | Summary prompt construction, model-based draft generation, and deterministic fallback summary |
+| `exa.ts` | Exa.ai search provider — direct API and MCP proxy, budget tracking |
+| `code-search.ts` | Code/docs search via Exa MCP |
 | `extract.ts` | URL/file path routing, HTTP extraction, fallback orchestration |
-| `gemini-search.ts` | Search routing across Perplexity, Gemini API, Gemini Web |
+| `gemini-search.ts` | Search routing across Exa, Perplexity, Gemini API, Gemini Web |
 | `gemini-url-context.ts` | Gemini URL Context + Web extraction fallbacks |
 | `gemini-web.ts` | Gemini Web client (cookie auth, StreamGenerate) |
 | `gemini-api.ts` | Gemini REST API client (generateContent) |

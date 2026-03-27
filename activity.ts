@@ -93,7 +93,6 @@ export class ActivityMonitor {
 			try {
 				cb();
 			} catch {
-				/* ignore */
 			}
 		}
 	}

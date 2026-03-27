@@ -317,5 +317,6 @@ function copySidecar(srcDb: string, targetDb: string, suffix: string): void {
 	if (!existsSync(sidecar)) return;
 	try {
 		copyFileSync(sidecar, `${targetDb}${suffix}`);
-	} catch {}
+	} catch {
+	}
 }

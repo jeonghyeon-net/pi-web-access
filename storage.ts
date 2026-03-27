@@ -9,6 +9,7 @@ export interface QueryResultData {
 	answer: string;
 	results: SearchResult[];
 	error: string | null;
+	provider?: string;
 }
 
 export interface StoredSearchData {

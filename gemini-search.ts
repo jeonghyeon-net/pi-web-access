@@ -8,6 +8,11 @@ import { isPerplexityAvailable, searchWithPerplexity, type SearchResult, type Se
 import { hasExaApiKey, isExaAvailable, searchWithExa } from "./exa.js";
 
 export type SearchProvider = "auto" | "perplexity" | "gemini" | "exa";
+export type ResolvedSearchProvider = Exclude<SearchProvider, "auto">;
+
+export interface AttributedSearchResponse extends SearchResponse {
+	provider: ResolvedSearchProvider;
+}
 
 const CONFIG_PATH = join(homedir(), ".pi", "web-search.json");
 
@@ -15,25 +20,46 @@ let cachedSearchConfig: { searchProvider: SearchProvider; searchModel?: string }
 
 function getSearchConfig(): { searchProvider: SearchProvider; searchModel?: string } {
 	if (cachedSearchConfig) return cachedSearchConfig;
+	if (!existsSync(CONFIG_PATH)) {
+		cachedSearchConfig = { searchProvider: "auto", searchModel: undefined };
+		return cachedSearchConfig;
+	}
+
+	const rawText = readFileSync(CONFIG_PATH, "utf-8");
+	let raw: {
+		searchProvider?: SearchProvider;
+		provider?: SearchProvider;
+		searchModel?: unknown;
+	};
 	try {
-		if (existsSync(CONFIG_PATH)) {
-			const raw = JSON.parse(readFileSync(CONFIG_PATH, "utf-8")) as {
-				searchProvider?: SearchProvider;
-				searchModel?: unknown;
-			};
-			cachedSearchConfig = {
-				searchProvider: raw.searchProvider ?? "auto",
-				searchModel: normalizeSearchModel(raw.searchModel),
-			};
-			return cachedSearchConfig;
-		}
-	} catch {}
-	cachedSearchConfig = { searchProvider: "auto", searchModel: undefined };
+		raw = JSON.parse(rawText) as {
+			searchProvider?: SearchProvider;
+			provider?: SearchProvider;
+			searchModel?: unknown;
+		};
+	} catch (err) {
+		const message = err instanceof Error ? err.message : String(err);
+		throw new Error(`Failed to parse ${CONFIG_PATH}: ${message}`);
+	}
+
+	cachedSearchConfig = {
+		searchProvider: normalizeSearchProvider(raw.searchProvider ?? raw.provider),
+		searchModel: normalizeSearchModel(raw.searchModel),
+	};
 	return cachedSearchConfig;
 }
 
 function normalizeSearchModel(value: unknown): string | undefined {
-	return typeof value === "string" && value.length > 0 ? value : undefined;
+	if (typeof value !== "string") return undefined;
+	const normalized = value.trim();
+	return normalized.length > 0 ? normalized : undefined;
+}
+
+function normalizeSearchProvider(value: unknown): SearchProvider {
+	const normalized = typeof value === "string" ? value.trim().toLowerCase() : "";
+	return normalized === "auto" || normalized === "perplexity" || normalized === "gemini" || normalized === "exa"
+		? normalized
+		: "auto";
 }
 
 export interface FullSearchOptions extends SearchOptions {
@@ -41,18 +67,56 @@ export interface FullSearchOptions extends SearchOptions {
 	includeContent?: boolean;
 }
 
-export async function search(query: string, options: FullSearchOptions = {}): Promise<SearchResponse> {
+function errorMessage(err: unknown): string {
+	return err instanceof Error ? err.message : String(err);
+}
+
+function isAbortError(err: unknown): boolean {
+	return errorMessage(err).toLowerCase().includes("abort");
+}
+
+async function searchWithGemini(
+	query: string,
+	options: SearchOptions,
+	strictErrors: boolean,
+): Promise<SearchResponse | null> {
+	const errors: string[] = [];
+
+	try {
+		const apiResult = await searchWithGeminiApi(query, options);
+		if (apiResult) return apiResult;
+	} catch (err) {
+		if (isAbortError(err)) throw err;
+		errors.push(`Gemini API: ${errorMessage(err)}`);
+	}
+
+	try {
+		const webResult = await searchWithGeminiWeb(query, options);
+		if (webResult) return webResult;
+	} catch (err) {
+		if (isAbortError(err)) throw err;
+		errors.push(`Gemini Web: ${errorMessage(err)}`);
+	}
+
+	if (strictErrors && errors.length > 0) {
+		throw new Error(`Gemini search failed:\n  - ${errors.join("\n  - ")}`);
+	}
+
+	return null;
+}
+
+export async function search(query: string, options: FullSearchOptions = {}): Promise<AttributedSearchResponse> {
 	const config = getSearchConfig();
 	const provider = options.provider ?? config.searchProvider;
 
 	if (provider === "perplexity") {
-		return searchWithPerplexity(query, options);
+		const result = await searchWithPerplexity(query, options);
+		return { ...result, provider: "perplexity" };
 	}
 
 	if (provider === "gemini") {
-		const result = await searchWithGeminiApi(query, options)
-			?? await searchWithGeminiWeb(query, options);
-		if (result) return result;
+		const result = await searchWithGemini(query, options, true);
+		if (result) return { ...result, provider: "gemini" };
 		throw new Error(
 			"Gemini search unavailable. Either:\n" +
 			"  1. Set GEMINI_API_KEY in ~/.pi/web-search.json\n" +
@@ -70,34 +134,51 @@ export async function search(query: string, options: FullSearchOptions = {}): Pr
 					"  Use provider: 'perplexity' or 'gemini', or upgrade at exa.ai/pricing"
 				);
 			}
-			if (result && "answer" in result) return result;
+			if (result && "answer" in result) return { ...result, provider: "exa" };
+			if (exaApiKeyConfigured) {
+				throw new Error("Exa search returned no results.");
+			}
 		} catch (err) {
-			if (exaApiKeyConfigured) throw err;
 			const message = err instanceof Error ? err.message : String(err);
 			if (message.toLowerCase().includes("abort")) throw err;
-		}
-		if (exaApiKeyConfigured) {
-			throw new Error("Exa search unavailable. Check EXA_API_KEY or exaApiKey in ~/.pi/web-search.json");
+			if (exaApiKeyConfigured) throw err;
+			// No API key: allow provider fallback.
 		}
 	}
+
+	const fallbackErrors: string[] = [];
 
 	if (provider !== "exa" && isExaAvailable()) {
 		try {
 			const result = await searchWithExa(query, options);
-			if (result && "answer" in result) return result;
+			if (result && "answer" in result) return { ...result, provider: "exa" };
 		} catch (err) {
-			const message = err instanceof Error ? err.message : String(err);
-			if (message.toLowerCase().includes("abort")) throw err;
+			if (isAbortError(err)) throw err;
+			fallbackErrors.push(`Exa: ${errorMessage(err)}`);
 		}
 	}
 
 	if (isPerplexityAvailable()) {
-		return searchWithPerplexity(query, options);
+		try {
+			const result = await searchWithPerplexity(query, options);
+			return { ...result, provider: "perplexity" };
+		} catch (err) {
+			if (isAbortError(err)) throw err;
+			fallbackErrors.push(`Perplexity: ${errorMessage(err)}`);
+		}
 	}
 
-	const geminiResult = await searchWithGeminiApi(query, options)
-		?? await searchWithGeminiWeb(query, options);
-	if (geminiResult) return geminiResult;
+	try {
+		const geminiResult = await searchWithGemini(query, options, false);
+		if (geminiResult) return { ...geminiResult, provider: "gemini" };
+	} catch (err) {
+		if (isAbortError(err)) throw err;
+		fallbackErrors.push(`Gemini: ${errorMessage(err)}`);
+	}
+
+	if (fallbackErrors.length > 0) {
+		throw new Error(`Auto provider search failed:\n  - ${fallbackErrors.join("\n  - ")}`);
+	}
 
 	throw new Error(
 		"No search provider available. Either:\n" +
@@ -154,7 +235,7 @@ async function searchWithGeminiApi(query: string, options: SearchOptions = {}): 
 		} else {
 			activityMonitor.logError(activityId, message);
 		}
-		return null;
+		throw err;
 	}
 }
 
@@ -183,7 +264,7 @@ async function searchWithGeminiWeb(query: string, options: SearchOptions = {}): 
 		} else {
 			activityMonitor.logError(activityId, message);
 		}
-		return null;
+		throw err;
 	}
 }
 

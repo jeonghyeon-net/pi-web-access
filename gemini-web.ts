@@ -40,21 +40,30 @@ export interface GeminiWebOptions {
 
 function loadConfig(): GeminiWebConfig {
 	if (cachedConfig) return cachedConfig;
-	if (existsSync(CONFIG_PATH)) {
-		try {
-			const raw = JSON.parse(readFileSync(CONFIG_PATH, "utf-8")) as { chromeProfile?: unknown };
-			cachedConfig = {
-				chromeProfile: normalizeChromeProfile(raw.chromeProfile),
-			};
-			return cachedConfig;
-		} catch {}
+	if (!existsSync(CONFIG_PATH)) {
+		cachedConfig = {};
+		return cachedConfig;
 	}
-	cachedConfig = {};
+
+	const rawText = readFileSync(CONFIG_PATH, "utf-8");
+	let raw: { chromeProfile?: unknown };
+	try {
+		raw = JSON.parse(rawText) as { chromeProfile?: unknown };
+	} catch (err) {
+		const message = err instanceof Error ? err.message : String(err);
+		throw new Error(`Failed to parse ${CONFIG_PATH}: ${message}`);
+	}
+
+	cachedConfig = {
+		chromeProfile: normalizeChromeProfile(raw.chromeProfile),
+	};
 	return cachedConfig;
 }
 
 function normalizeChromeProfile(value: unknown): string | undefined {
-	return typeof value === "string" && value.length > 0 ? value : undefined;
+	if (typeof value !== "string") return undefined;
+	const normalized = value.trim();
+	return normalized.length > 0 ? normalized : undefined;
 }
 
 function getChromeProfileFromConfig(): string | undefined {
@@ -83,7 +92,8 @@ export async function getActiveGoogleEmail(cookies: CookieMap): Promise<string |
 		);
 		const email = extractEmailFromGeminiHtml(html);
 		if (email) return email;
-	} catch {}
+	} catch {
+	}
 
 	try {
 		const response = await fetchWithCookieRedirects(
@@ -184,7 +194,8 @@ async function runGeminiWebOnce(
 		try {
 			const json = JSON.parse(trimJsonEnvelope(rawText));
 			errorCode = extractErrorCode(json);
-		} catch {}
+		} catch {
+		}
 		return {
 			text: "",
 			errorCode,
@@ -408,7 +419,8 @@ function parseStreamGenerateResponse(rawText: string): GeminiWebResult {
 				body = parsed;
 				break;
 			}
-		} catch {}
+		} catch {
+		}
 	}
 
 	const candidateList = getNestedValue(body, [4]);

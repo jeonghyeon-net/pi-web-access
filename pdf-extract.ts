@@ -34,23 +34,31 @@ export async function extractPDFToMarkdown(
   url: string,
   options: PDFExtractOptions = {}
 ): Promise<PDFExtractResult> {
-  const { 
-    maxPages = DEFAULT_MAX_PAGES, 
+  const {
+    maxPages = DEFAULT_MAX_PAGES,
     outputDir = DEFAULT_OUTPUT_DIR,
-    filename 
+    filename,
   } = options;
+
+  const safeMaxPages = Number.isFinite(maxPages)
+    ? Math.max(1, Math.floor(maxPages))
+    : DEFAULT_MAX_PAGES;
 
   const pdf = await getDocumentProxy(new Uint8Array(buffer));
   const metadata = await pdf.getMetadata();
-  
+  const metadataInfo = metadata.info && typeof metadata.info === "object"
+    ? metadata.info as Record<string, unknown>
+    : null;
+
   // Extract title from metadata or URL
-  const metaTitle = metadata.info?.Title as string | undefined;
+  const metaTitle = typeof metadataInfo?.Title === "string" ? metadataInfo.Title : undefined;
+  const metaAuthor = typeof metadataInfo?.Author === "string" ? metadataInfo.Author : undefined;
   const urlTitle = extractTitleFromURL(url);
   const title = metaTitle?.trim() || urlTitle;
 
   // Determine pages to extract
-  const pagesToExtract = Math.min(pdf.numPages, maxPages);
-  const truncated = pdf.numPages > maxPages;
+  const pagesToExtract = Math.min(pdf.numPages, safeMaxPages);
+  const truncated = pdf.numPages > safeMaxPages;
 
   // Extract text page by page for better structure
   const pages: { pageNum: number; text: string }[] = [];
@@ -79,8 +87,8 @@ export async function extractPDFToMarkdown(
   lines.push("");
   lines.push(`> Source: ${url}`);
   lines.push(`> Pages: ${pdf.numPages}${truncated ? ` (extracted first ${pagesToExtract})` : ""}`);
-  if (metadata.info?.Author) {
-    lines.push(`> Author: ${metadata.info.Author}`);
+  if (metaAuthor) {
+    lines.push(`> Author: ${metaAuthor}`);
   }
   lines.push("");
   lines.push("---");

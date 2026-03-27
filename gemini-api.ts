@@ -7,21 +7,26 @@ const CONFIG_PATH = join(homedir(), ".pi", "web-search.json");
 export const DEFAULT_MODEL = "gemini-3-flash-preview";
 
 interface GeminiApiConfig {
-	geminiApiKey?: string;
+	geminiApiKey?: unknown;
 }
 
 let cachedConfig: GeminiApiConfig | null = null;
 
 function loadConfig(): GeminiApiConfig {
 	if (cachedConfig) return cachedConfig;
-	if (existsSync(CONFIG_PATH)) {
-		try {
-			cachedConfig = JSON.parse(readFileSync(CONFIG_PATH, "utf-8")) as GeminiApiConfig;
-			return cachedConfig;
-		} catch {}
+	if (!existsSync(CONFIG_PATH)) {
+		cachedConfig = {};
+		return cachedConfig;
 	}
-	cachedConfig = {};
-	return cachedConfig;
+
+	const raw = readFileSync(CONFIG_PATH, "utf-8");
+	try {
+		cachedConfig = JSON.parse(raw) as GeminiApiConfig;
+		return cachedConfig;
+	} catch (err) {
+		const message = err instanceof Error ? err.message : String(err);
+		throw new Error(`Failed to parse ${CONFIG_PATH}: ${message}`);
+	}
 }
 
 function withTimeout(signal: AbortSignal | undefined, timeoutMs: number): AbortSignal {
@@ -29,10 +34,14 @@ function withTimeout(signal: AbortSignal | undefined, timeoutMs: number): AbortS
 	return signal ? AbortSignal.any([signal, timeout]) : timeout;
 }
 
+function normalizeApiKey(value: unknown): string | null {
+	if (typeof value !== "string") return null;
+	const normalized = value.trim();
+	return normalized.length > 0 ? normalized : null;
+}
+
 export function getApiKey(): string | null {
-	const envKey = process.env.GEMINI_API_KEY;
-	if (envKey) return envKey;
-	return loadConfig().geminiApiKey ?? null;
+	return normalizeApiKey(process.env.GEMINI_API_KEY) ?? normalizeApiKey(loadConfig().geminiApiKey);
 }
 
 export function isGeminiApiAvailable(): boolean {

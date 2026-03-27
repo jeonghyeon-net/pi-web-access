@@ -17,6 +17,22 @@ const CONCURRENT_LIMIT = 3;
 const NON_RECOVERABLE_ERRORS = ["Unsupported content type", "Response too large"];
 const MIN_USEFUL_CONTENT = 500;
 
+function errorMessage(err: unknown): string {
+	return err instanceof Error ? err.message : String(err);
+}
+
+function isConfigParseError(err: unknown): boolean {
+	return errorMessage(err).startsWith("Failed to parse ");
+}
+
+function isAbortError(err: unknown): boolean {
+	return errorMessage(err).toLowerCase().includes("abort");
+}
+
+function abortedResult(url: string): ExtractedContent {
+	return { url, title: "", content: "", error: "Aborted" };
+}
+
 const turndown = new TurndownService({
 	headingStyle: "atx",
 	codeBlockStyle: "fenced",
@@ -181,6 +197,14 @@ async function extractLocalFrames(
 	return { frames, error: frames.length === 0 && firstError ? firstError.error : null };
 }
 
+function safeVideoInfo(url: string): { info: ReturnType<typeof isVideoFile>; error?: string } {
+	try {
+		return { info: isVideoFile(url) };
+	} catch (err) {
+		return { info: null, error: errorMessage(err) };
+	}
+}
+
 export async function extractContent(
 	url: string,
 	signal?: AbortSignal,
@@ -209,15 +233,18 @@ export async function extractContent(
 			return buildFrameResult(url, label, timestamps.length, result.frames, result.error, streamInfo.duration);
 		}
 
-		const videoInfo = isVideoFile(url);
-		if (videoInfo) {
-			const durationResult = await getLocalVideoDuration(videoInfo.absolutePath);
+		const localVideo = safeVideoInfo(url);
+		if (localVideo.error) {
+			return { url, title: "", content: "", error: localVideo.error };
+		}
+		if (localVideo.info) {
+			const durationResult = await getLocalVideoDuration(localVideo.info.absolutePath);
 			if (typeof durationResult !== "number") {
 				return { url, title: "Frames", content: durationResult.error, error: durationResult.error };
 			}
 			const dur = Math.floor(durationResult);
 			const timestamps = computeRangeTimestamps(0, dur, frameCount);
-			const result = await extractLocalFrames(videoInfo.absolutePath, timestamps);
+			const result = await extractLocalFrames(localVideo.info.absolutePath, timestamps);
 			const label = `${formatSeconds(0)}-${formatSeconds(dur)}`;
 			return buildFrameResult(url, label, timestamps.length, result.frames, result.error, durationResult);
 		}
@@ -227,92 +254,113 @@ export async function extractContent(
 
 	if (options?.timestamp) {
 		const spec = parseTimestampSpec(options.timestamp);
-		if (spec) {
-			const frameCount = options.frames;
-			const ytInfo = isYouTubeURL(url);
-			if (ytInfo.isYouTube && ytInfo.videoId) {
-				const streamInfo = await getYouTubeStreamInfo(ytInfo.videoId);
-				if ("error" in streamInfo) {
-					if (spec.type === "range") {
-						const label = `${formatSeconds(spec.start)}-${formatSeconds(spec.end)}`;
-						return { url, title: `Frames ${label}`, content: streamInfo.error, error: streamInfo.error };
-					}
-					if (frameCount) {
-						const end = spec.seconds + (frameCount - 1) * MIN_FRAME_INTERVAL;
-						const label = `${formatSeconds(spec.seconds)}-${formatSeconds(end)}`;
-						return { url, title: `Frames ${label}`, content: streamInfo.error, error: streamInfo.error };
-					}
-					return { url, title: `Frame at ${options.timestamp}`, content: streamInfo.error, error: streamInfo.error };
-				}
-
-				if (spec.type === "range") {
-					const label = `${formatSeconds(spec.start)}-${formatSeconds(spec.end)}`;
-					if (streamInfo.duration !== null && spec.end > streamInfo.duration) {
-						const error = `Timestamp ${formatSeconds(spec.end)} exceeds video duration (${formatSeconds(Math.floor(streamInfo.duration))})`;
-						return { url, title: `Frames ${label}`, content: error, error };
-					}
-					const timestamps = frameCount
-						? computeRangeTimestamps(spec.start, spec.end, frameCount)
-						: computeRangeTimestamps(spec.start, spec.end);
-					const result = await extractYouTubeFrames(ytInfo.videoId, timestamps, streamInfo);
-					return buildFrameResult(url, label, timestamps.length, result.frames, result.error, result.duration ?? undefined);
-				}
-
-				if (frameCount) {
-					const end = spec.seconds + (frameCount - 1) * MIN_FRAME_INTERVAL;
-					const label = `${formatSeconds(spec.seconds)}-${formatSeconds(end)}`;
-					if (streamInfo.duration !== null && end > streamInfo.duration) {
-						const error = `Timestamp ${formatSeconds(end)} exceeds video duration (${formatSeconds(Math.floor(streamInfo.duration))})`;
-						return { url, title: `Frames ${label}`, content: error, error };
-					}
-					const timestamps = computeRangeTimestamps(spec.seconds, end, frameCount);
-					const result = await extractYouTubeFrames(ytInfo.videoId, timestamps, streamInfo);
-					return buildFrameResult(url, label, timestamps.length, result.frames, result.error, result.duration ?? undefined);
-				}
-
-				if (streamInfo.duration !== null && spec.seconds > streamInfo.duration) {
-					const error = `Timestamp ${formatSeconds(spec.seconds)} exceeds video duration (${formatSeconds(Math.floor(streamInfo.duration))})`;
-					return { url, title: `Frame at ${options.timestamp}`, content: error, error };
-				}
-				const frame = await extractYouTubeFrame(ytInfo.videoId, spec.seconds, streamInfo);
-				if ("error" in frame) {
-					return { url, title: `Frame at ${options.timestamp}`, content: frame.error, error: frame.error };
-				}
-				return { url, title: `Frame at ${options.timestamp}`, content: `Video frame at ${options.timestamp}`, error: null, thumbnail: frame };
-			}
-
-			const videoInfo = isVideoFile(url);
-			if (videoInfo) {
-				if (spec.type === "range") {
-					const timestamps = frameCount
-						? computeRangeTimestamps(spec.start, spec.end, frameCount)
-						: computeRangeTimestamps(spec.start, spec.end);
-					const result = await extractLocalFrames(videoInfo.absolutePath, timestamps);
-					const label = `${formatSeconds(spec.start)}-${formatSeconds(spec.end)}`;
-					return buildFrameResult(url, label, timestamps.length, result.frames, result.error);
-				}
-
-				if (frameCount) {
-					const end = spec.seconds + (frameCount - 1) * MIN_FRAME_INTERVAL;
-					const timestamps = computeRangeTimestamps(spec.seconds, end, frameCount);
-					const result = await extractLocalFrames(videoInfo.absolutePath, timestamps);
-					const label = `${formatSeconds(spec.seconds)}-${formatSeconds(end)}`;
-					return buildFrameResult(url, label, timestamps.length, result.frames, result.error);
-				}
-
-				const frame = await extractVideoFrame(videoInfo.absolutePath, spec.seconds);
-				if ("error" in frame) {
-					return { url, title: `Frame at ${options.timestamp}`, content: frame.error, error: frame.error };
-				}
-				return { url, title: `Frame at ${options.timestamp}`, content: `Video frame at ${options.timestamp}`, error: null, thumbnail: frame };
-			}
+		if (!spec) {
+			return {
+				url,
+				title: "",
+				content: "",
+				error: `Invalid timestamp format: "${options.timestamp}". Use "H:MM:SS", "MM:SS", "85", or "start-end".`,
+			};
 		}
+
+		const frameCount = options.frames;
+		const ytInfo = isYouTubeURL(url);
+		if (ytInfo.isYouTube && ytInfo.videoId) {
+			const streamInfo = await getYouTubeStreamInfo(ytInfo.videoId);
+			if ("error" in streamInfo) {
+				if (spec.type === "range") {
+					const label = `${formatSeconds(spec.start)}-${formatSeconds(spec.end)}`;
+					return { url, title: `Frames ${label}`, content: streamInfo.error, error: streamInfo.error };
+				}
+				if (frameCount) {
+					const end = spec.seconds + (frameCount - 1) * MIN_FRAME_INTERVAL;
+					const label = `${formatSeconds(spec.seconds)}-${formatSeconds(end)}`;
+					return { url, title: `Frames ${label}`, content: streamInfo.error, error: streamInfo.error };
+				}
+				return { url, title: `Frame at ${options.timestamp}`, content: streamInfo.error, error: streamInfo.error };
+			}
+
+			if (spec.type === "range") {
+				const label = `${formatSeconds(spec.start)}-${formatSeconds(spec.end)}`;
+				if (streamInfo.duration !== null && spec.end > streamInfo.duration) {
+					const error = `Timestamp ${formatSeconds(spec.end)} exceeds video duration (${formatSeconds(Math.floor(streamInfo.duration))})`;
+					return { url, title: `Frames ${label}`, content: error, error };
+				}
+				const timestamps = frameCount
+					? computeRangeTimestamps(spec.start, spec.end, frameCount)
+					: computeRangeTimestamps(spec.start, spec.end);
+				const result = await extractYouTubeFrames(ytInfo.videoId, timestamps, streamInfo);
+				return buildFrameResult(url, label, timestamps.length, result.frames, result.error, result.duration ?? undefined);
+			}
+
+			if (frameCount) {
+				const end = spec.seconds + (frameCount - 1) * MIN_FRAME_INTERVAL;
+				const label = `${formatSeconds(spec.seconds)}-${formatSeconds(end)}`;
+				if (streamInfo.duration !== null && end > streamInfo.duration) {
+					const error = `Timestamp ${formatSeconds(end)} exceeds video duration (${formatSeconds(Math.floor(streamInfo.duration))})`;
+					return { url, title: `Frames ${label}`, content: error, error };
+				}
+				const timestamps = computeRangeTimestamps(spec.seconds, end, frameCount);
+				const result = await extractYouTubeFrames(ytInfo.videoId, timestamps, streamInfo);
+				return buildFrameResult(url, label, timestamps.length, result.frames, result.error, result.duration ?? undefined);
+			}
+
+			if (streamInfo.duration !== null && spec.seconds > streamInfo.duration) {
+				const error = `Timestamp ${formatSeconds(spec.seconds)} exceeds video duration (${formatSeconds(Math.floor(streamInfo.duration))})`;
+				return { url, title: `Frame at ${options.timestamp}`, content: error, error };
+			}
+			const frame = await extractYouTubeFrame(ytInfo.videoId, spec.seconds, streamInfo);
+			if ("error" in frame) {
+				return { url, title: `Frame at ${options.timestamp}`, content: frame.error, error: frame.error };
+			}
+			return { url, title: `Frame at ${options.timestamp}`, content: `Video frame at ${options.timestamp}`, error: null, thumbnail: frame };
+		}
+
+		const localVideo = safeVideoInfo(url);
+		if (localVideo.error) {
+			return { url, title: "", content: "", error: localVideo.error };
+		}
+		if (localVideo.info) {
+			if (spec.type === "range") {
+				const timestamps = frameCount
+					? computeRangeTimestamps(spec.start, spec.end, frameCount)
+					: computeRangeTimestamps(spec.start, spec.end);
+				const result = await extractLocalFrames(localVideo.info.absolutePath, timestamps);
+				const label = `${formatSeconds(spec.start)}-${formatSeconds(spec.end)}`;
+				return buildFrameResult(url, label, timestamps.length, result.frames, result.error);
+			}
+
+			if (frameCount) {
+				const end = spec.seconds + (frameCount - 1) * MIN_FRAME_INTERVAL;
+				const timestamps = computeRangeTimestamps(spec.seconds, end, frameCount);
+				const result = await extractLocalFrames(localVideo.info.absolutePath, timestamps);
+				const label = `${formatSeconds(spec.seconds)}-${formatSeconds(end)}`;
+				return buildFrameResult(url, label, timestamps.length, result.frames, result.error);
+			}
+
+			const frame = await extractVideoFrame(localVideo.info.absolutePath, spec.seconds);
+			if ("error" in frame) {
+				return { url, title: `Frame at ${options.timestamp}`, content: frame.error, error: frame.error };
+			}
+			return { url, title: `Frame at ${options.timestamp}`, content: `Video frame at ${options.timestamp}`, error: null, thumbnail: frame };
+		}
+
+		return { url, title: "", content: "", error: "Timestamp extraction only works with YouTube and local video files" };
 	}
 
-	const videoInfo = isVideoFile(url);
-	if (videoInfo) {
-		const result = await extractVideo(videoInfo, signal, options);
-		return result ?? { url, title: "", content: "", error: "Video analysis requires Gemini access. Either:\n  1. Sign into gemini.google.com in Chrome (free, uses cookies)\n  2. Set GEMINI_API_KEY in ~/.pi/web-search.json" };
+	const localVideo = safeVideoInfo(url);
+	if (localVideo.error) {
+		return { url, title: "", content: "", error: localVideo.error };
+	}
+	if (localVideo.info) {
+		try {
+			const result = await extractVideo(localVideo.info, signal, options);
+			if (signal?.aborted) return abortedResult(url);
+			return result ?? { url, title: "", content: "", error: "Video analysis requires Gemini access. Either:\n  1. Sign into gemini.google.com in Chrome (free, uses cookies)\n  2. Set GEMINI_API_KEY in ~/.pi/web-search.json" };
+		} catch (err) {
+			if (isAbortError(err)) return abortedResult(url);
+			return { url, title: "", content: "", error: errorMessage(err) };
+		}
 	}
 
 	try {
@@ -324,14 +372,34 @@ export async function extractContent(
 	try {
 		const ghResult = await extractGitHub(url, signal, options?.forceClone);
 		if (ghResult) return ghResult;
-	} catch {}
+		if (signal?.aborted) return abortedResult(url);
+	} catch (err) {
+		const message = errorMessage(err);
+		if (isAbortError(err)) return abortedResult(url);
+		if (isConfigParseError(err)) {
+			return { url, title: "", content: "", error: message };
+		}
+	}
 
 	const ytInfo = isYouTubeURL(url);
-	if (ytInfo.isYouTube && isYouTubeEnabled()) {
+	let youtubeEnabled = false;
+	try {
+		youtubeEnabled = isYouTubeEnabled();
+	} catch (err) {
+		return { url, title: "", content: "", error: errorMessage(err) };
+	}
+	if (ytInfo.isYouTube && youtubeEnabled) {
 		try {
 			const ytResult = await extractYouTube(url, signal, options?.prompt, options?.model);
 			if (ytResult) return ytResult;
-		} catch {}
+			if (signal?.aborted) return abortedResult(url);
+		} catch (err) {
+			const message = errorMessage(err);
+			if (isAbortError(err)) return abortedResult(url);
+			if (isConfigParseError(err)) {
+				return { url, title: "", content: "", error: message };
+			}
+		}
 		return {
 			url,
 			title: "",
@@ -340,18 +408,31 @@ export async function extractContent(
 		};
 	}
 
+	if (signal?.aborted) return abortedResult(url);
+
 	const httpResult = await extractViaHttp(url, signal, options);
 
-	if (!httpResult.error || signal?.aborted) return httpResult;
+	if (signal?.aborted) return abortedResult(url);
+	if (!httpResult.error) return httpResult;
 	if (NON_RECOVERABLE_ERRORS.some(prefix => httpResult.error!.startsWith(prefix))) return httpResult;
 
 	const jinaResult = await extractWithJinaReader(url, signal);
 	if (jinaResult) return jinaResult;
+	if (signal?.aborted) return abortedResult(url);
 
-	const geminiResult = await extractWithUrlContext(url, signal)
-		?? await extractWithGeminiWeb(url, signal);
+	let geminiResult: ExtractedContent | null = null;
+	try {
+		geminiResult = await extractWithUrlContext(url, signal)
+			?? await extractWithGeminiWeb(url, signal);
+	} catch (err) {
+		if (isAbortError(err)) return abortedResult(url);
+		if (isConfigParseError(err)) {
+			return { ...httpResult, error: errorMessage(err) };
+		}
+	}
 
 	if (geminiResult) return geminiResult;
+	if (signal?.aborted) return abortedResult(url);
 
 	const guidance = [
 		httpResult.error,

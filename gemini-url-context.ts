@@ -9,6 +9,11 @@ Do not summarize — extract the full content.
 
 URL: `;
 
+function shouldRethrow(err: unknown): boolean {
+	const message = err instanceof Error ? err.message : String(err);
+	return message.startsWith("Failed to parse ");
+}
+
 export async function extractWithUrlContext(
 	url: string,
 	signal?: AbortSignal,
@@ -59,6 +64,7 @@ export async function extractWithUrlContext(
 		const title = extractTitleFromContent(content, url);
 		return { url, title, content, error: null };
 	} catch (err) {
+		if (shouldRethrow(err)) throw err;
 		const message = err instanceof Error ? err.message : String(err);
 		if (message.toLowerCase().includes("abort")) {
 			activityMonitor.logComplete(activityId, 0);
@@ -92,6 +98,7 @@ export async function extractWithGeminiWeb(
 		const title = extractTitleFromContent(text, url);
 		return { url, title, content: text, error: null };
 	} catch (err) {
+		if (shouldRethrow(err)) throw err;
 		const message = err instanceof Error ? err.message : String(err);
 		if (message.toLowerCase().includes("abort")) {
 			activityMonitor.logComplete(activityId, 0);

@@ -32,6 +32,11 @@ const VIDEO_EXTENSIONS: Record<string, string> = {
 	".3gpp": "video/3gpp",
 };
 
+function shouldRethrow(err: unknown): boolean {
+	const message = err instanceof Error ? err.message : String(err);
+	return message.startsWith("Failed to parse ");
+}
+
 interface VideoFileInfo {
 	absolutePath: string;
 	mimeType: string;
@@ -44,6 +49,21 @@ interface VideoConfig {
 	maxSizeMB: number;
 }
 
+function normalizePreferredModel(value: unknown, fallback: string): string {
+	if (typeof value !== "string") return fallback;
+	const normalized = value.trim();
+	return normalized.length > 0 ? normalized : fallback;
+}
+
+function normalizeEnabled(value: unknown, fallback: boolean): boolean {
+	return typeof value === "boolean" ? value : fallback;
+}
+
+function normalizeMaxSizeMB(value: unknown, fallback: number): number {
+	if (typeof value !== "number" || !Number.isFinite(value)) return fallback;
+	return value > 0 ? value : fallback;
+}
+
 const VIDEO_CONFIG_DEFAULTS: VideoConfig = {
 	enabled: true,
 	preferredModel: "gemini-3-flash-preview",
@@ -54,19 +74,26 @@ let cachedVideoConfig: VideoConfig | null = null;
 
 function loadVideoConfig(): VideoConfig {
 	if (cachedVideoConfig) return cachedVideoConfig;
+	if (!existsSync(CONFIG_PATH)) {
+		cachedVideoConfig = { ...VIDEO_CONFIG_DEFAULTS };
+		return cachedVideoConfig;
+	}
+
+	const rawText = readFileSync(CONFIG_PATH, "utf-8");
+	let raw: { video?: { enabled?: boolean; preferredModel?: string; maxSizeMB?: number } };
 	try {
-		if (existsSync(CONFIG_PATH)) {
-			const raw = JSON.parse(readFileSync(CONFIG_PATH, "utf-8"));
-			const v = raw.video ?? {};
-			cachedVideoConfig = {
-				enabled: v.enabled ?? VIDEO_CONFIG_DEFAULTS.enabled,
-				preferredModel: v.preferredModel ?? VIDEO_CONFIG_DEFAULTS.preferredModel,
-				maxSizeMB: v.maxSizeMB ?? VIDEO_CONFIG_DEFAULTS.maxSizeMB,
-			};
-			return cachedVideoConfig;
-		}
-	} catch {}
-	cachedVideoConfig = { ...VIDEO_CONFIG_DEFAULTS };
+		raw = JSON.parse(rawText) as { video?: { enabled?: boolean; preferredModel?: string; maxSizeMB?: number } };
+	} catch (err) {
+		const message = err instanceof Error ? err.message : String(err);
+		throw new Error(`Failed to parse ${CONFIG_PATH}: ${message}`);
+	}
+
+	const v = raw.video ?? {};
+	cachedVideoConfig = {
+		enabled: normalizeEnabled(v.enabled, VIDEO_CONFIG_DEFAULTS.enabled),
+		preferredModel: normalizePreferredModel(v.preferredModel, VIDEO_CONFIG_DEFAULTS.preferredModel),
+		maxSizeMB: normalizeMaxSizeMB(v.maxSizeMB, VIDEO_CONFIG_DEFAULTS.maxSizeMB),
+	};
 	return cachedVideoConfig;
 }
 
@@ -77,7 +104,14 @@ export function isVideoFile(input: string): VideoFileInfo | null {
 	const isFilePath = input.startsWith("/") || input.startsWith("./") || input.startsWith("../") || input.startsWith("file://");
 	if (!isFilePath) return null;
 
-	const filePath = input.startsWith("file://") ? new URL(input).pathname : input;
+	let filePath = input;
+	if (input.startsWith("file://")) {
+		try {
+			filePath = decodeURIComponent(new URL(input).pathname);
+		} catch {
+			return null;
+		}
+	}
 
 	const ext = extname(filePath).toLowerCase();
 	const mimeType = VIDEO_EXTENSIONS[ext];
@@ -86,7 +120,12 @@ export function isVideoFile(input: string): VideoFileInfo | null {
 	const absolutePath = resolveFilePath(filePath);
 	if (!absolutePath) return null;
 
-	const stat = statSync(absolutePath);
+	let stat: ReturnType<typeof statSync>;
+	try {
+		stat = statSync(absolutePath);
+	} catch {
+		return null;
+	}
 	if (!stat.isFile()) return null;
 
 	const maxBytes = config.maxSizeMB * 1024 * 1024;
@@ -137,6 +176,11 @@ export async function extractVideo(
 		}
 		activityMonitor.logComplete(activityId, 200);
 		return result;
+	}
+
+	if (signal?.aborted) {
+		activityMonitor.logComplete(activityId, 0);
+		return null;
 	}
 
 	activityMonitor.logError(activityId, "all video extraction paths failed");
@@ -205,7 +249,8 @@ async function tryVideoGeminiWeb(
 			content: text,
 			error: null,
 		};
-	} catch {
+	} catch (err) {
+		if (shouldRethrow(err)) throw err;
 		return null;
 	}
 }
@@ -240,7 +285,8 @@ async function tryVideoGeminiApi(
 			content: text,
 			error: null,
 		};
-	} catch {
+	} catch (err) {
+		if (shouldRethrow(err)) throw err;
 		return null;
 	} finally {
 		if (fileName) deleteGeminiFile(fileName, apiKey);
@@ -322,7 +368,10 @@ async function pollFileState(
 }
 
 function deleteGeminiFile(fileName: string, apiKey: string): void {
-	fetch(`${API_BASE}/${fileName}?key=${apiKey}`, { method: "DELETE" }).catch(() => {});
+	fetch(`${API_BASE}/${fileName}?key=${apiKey}`, { method: "DELETE" }).catch((err) => {
+		const message = err instanceof Error ? err.message : String(err);
+		console.error(`Failed to delete Gemini file ${fileName}: ${message}`);
+	});
 }
 
 function extractVideoTitle(text: string, filePath: string): string {
