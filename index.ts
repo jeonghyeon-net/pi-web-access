@@ -1546,13 +1546,21 @@ export default function (pi: ExtensionAPI) {
 		},
 
 		renderResult(result, { expanded }, theme) {
-			const details = result.details as { query?: string; maxTokens?: number; error?: string };
+			const details = result.details as {
+				query?: string;
+				maxTokens?: number;
+				strategy?: "get_code_context_exa" | "web_search_exa_fallback";
+				error?: string;
+			};
 			if (details?.error) {
 				return new Text(theme.fg("error", `Error: ${details.error}`), 0, 0);
 			}
 
+			const strategyLabel = details?.strategy === "web_search_exa_fallback"
+				? "fallback via web_search_exa"
+				: "via get_code_context_exa";
 			const summary = theme.fg("success", "code context returned") +
-				theme.fg("muted", ` (${details?.maxTokens ?? 5000} tokens max)`);
+				theme.fg("muted", ` (${details?.maxTokens ?? 5000} tokens max, ${strategyLabel})`);
 			if (!expanded) return new Text(summary, 0, 0);
 
 			const textContent = result.content.find((c) => c.type === "text")?.text || "";

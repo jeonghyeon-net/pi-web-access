@@ -4,6 +4,13 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.10.7] - 2026-04-22
+
+### Fixed
+- `code_search` now detects when Exa MCP no longer exposes `get_code_context_exa` and automatically falls back to `web_search_exa` plus `web_fetch_exa` instead of failing with `Tool ... not found`.
+- Exa MCP web search now validates available tools up front and uses `web_fetch_exa` for `includeContent` instead of relying on undocumented `web_search_exa` request fields.
+- Added Exa MCP tool discovery/caching so MCP capability drift is handled more gracefully and surfaced with clearer errors.
+
 ## [0.10.6] - 2026-04-04
 
 ### Changed

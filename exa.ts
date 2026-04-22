@@ -13,6 +13,8 @@ const USAGE_PATH = join(homedir(), ".pi", "exa-usage.json");
 
 const MONTHLY_LIMIT = 1000;
 const WARNING_THRESHOLD = 800;
+const MCP_TOOLS_CACHE_TTL_MS = 5 * 60 * 1000;
+const CODE_SEARCH_FETCH_URL_LIMIT = 4;
 
 interface WebSearchConfig {
 	exaApiKey?: unknown;
@@ -40,11 +42,23 @@ interface ExaSearchResponse {
 	}>;
 }
 
-interface ExaMcpRpcResponse {
-	result?: {
-		content?: Array<{ type?: string; text?: string }>;
-		isError?: boolean;
+interface ExaMcpToolDefinition {
+	name?: string;
+	inputSchema?: {
+		properties?: Record<string, unknown>;
 	};
+	[key: string]: unknown;
+}
+
+interface ExaMcpRpcResult {
+	content?: Array<{ type?: string; text?: string }>;
+	isError?: boolean;
+	tools?: ExaMcpToolDefinition[];
+	[key: string]: unknown;
+}
+
+interface ExaMcpRpcResponse {
+	result?: ExaMcpRpcResult;
 	error?: {
 		code?: number;
 		message?: string;
@@ -61,6 +75,7 @@ type McpParsedResult = { title: string; url: string; content: string };
 
 let cachedConfig: WebSearchConfig | null = null;
 let warnedMonth: string | null = null;
+let cachedMcpTools: { fetchedAt: number; tools: ExaMcpToolDefinition[] } | null = null;
 
 function loadConfig(): WebSearchConfig {
 	if (cachedConfig) return cachedConfig;
@@ -219,11 +234,33 @@ function mapInlineContent(results: ExaSearchResponse["results"]): ExtractedConte
 		}));
 }
 
-export async function callExaMcp(
-	toolName: string,
-	args: Record<string, unknown>,
-	signal?: AbortSignal,
-): Promise<string> {
+function parseExaMcpResponse(body: string): ExaMcpRpcResponse | null {
+	const dataLines = body.split("\n").filter(line => line.startsWith("data:"));
+
+	for (const line of dataLines) {
+		const payload = line.slice(5).trim();
+		if (!payload) continue;
+		try {
+			const candidate = JSON.parse(payload) as ExaMcpRpcResponse;
+			if (candidate?.result || candidate?.error) {
+				return candidate;
+			}
+		} catch {
+		}
+	}
+
+	try {
+		const candidate = JSON.parse(body) as ExaMcpRpcResponse;
+		if (candidate?.result || candidate?.error) {
+			return candidate;
+		}
+	} catch {
+	}
+
+	return null;
+}
+
+async function exaMcpRpc(method: string, params: Record<string, unknown>, signal?: AbortSignal): Promise<ExaMcpRpcResponse> {
 	const response = await fetch(EXA_MCP_URL, {
 		method: "POST",
 		headers: {
@@ -233,11 +270,8 @@ export async function callExaMcp(
 		body: JSON.stringify({
 			jsonrpc: "2.0",
 			id: 1,
-			method: "tools/call",
-			params: {
-				name: toolName,
-				arguments: args,
-			},
+			method,
+			params,
 		}),
 		signal: requestSignal(signal),
 	});
@@ -248,32 +282,7 @@ export async function callExaMcp(
 	}
 
 	const body = await response.text();
-	const dataLines = body.split("\n").filter(line => line.startsWith("data:"));
-
-	let parsed: ExaMcpRpcResponse | null = null;
-	for (const line of dataLines) {
-		const payload = line.slice(5).trim();
-		if (!payload) continue;
-		try {
-			const candidate = JSON.parse(payload) as ExaMcpRpcResponse;
-			if (candidate?.result || candidate?.error) {
-				parsed = candidate;
-				break;
-			}
-		} catch {
-		}
-	}
-
-	if (!parsed) {
-		try {
-			const candidate = JSON.parse(body) as ExaMcpRpcResponse;
-			if (candidate?.result || candidate?.error) {
-				parsed = candidate;
-			}
-		} catch {
-		}
-	}
-
+	const parsed = parseExaMcpResponse(body);
 	if (!parsed) {
 		throw new Error("Exa MCP returned an empty response");
 	}
@@ -283,6 +292,162 @@ export async function callExaMcp(
 		const message = parsed.error.message || "Unknown error";
 		throw new Error(`Exa MCP error${code}: ${message}`);
 	}
+
+	return parsed;
+}
+
+async function listExaMcpToolDefinitions(signal?: AbortSignal): Promise<ExaMcpToolDefinition[]> {
+	if (cachedMcpTools && Date.now() - cachedMcpTools.fetchedAt < MCP_TOOLS_CACHE_TTL_MS) {
+		return cachedMcpTools.tools;
+	}
+
+	const parsed = await exaMcpRpc("tools/list", {}, signal);
+	const tools = parsed.result?.tools?.filter((tool): tool is ExaMcpToolDefinition => !!tool && typeof tool === "object") ?? [];
+	cachedMcpTools = { fetchedAt: Date.now(), tools };
+	return tools;
+}
+
+export async function listExaMcpTools(signal?: AbortSignal): Promise<string[]> {
+	const tools = await listExaMcpToolDefinitions(signal);
+	return tools
+		.map(tool => typeof tool.name === "string" ? tool.name.trim() : "")
+		.filter((name): name is string => name.length > 0);
+}
+
+function formatAvailableExaMcpTools(tools: string[]): string {
+	return tools.length > 0 ? tools.join(", ") : "unknown";
+}
+
+function isMissingExaMcpToolError(message: string): boolean {
+	return /tool\s+.+\s+(?:not found|unavailable)/i.test(message);
+}
+
+function buildCodeSearchFallbackQuery(query: string): string {
+	return `Programming documentation, API references, GitHub issues, Stack Overflow answers, and concrete code examples for: ${query}`;
+}
+
+function truncateText(text: string, maxChars: number): string {
+	if (text.length <= maxChars) return text;
+	return text.slice(0, Math.max(0, maxChars - 16)).trimEnd() + "\n\n[truncated]";
+}
+
+function parseMcpFetchedContent(text: string): ExtractedContent[] {
+	const blocks = text.split(/(?=^# .+\nURL: )/m).filter(block => block.trim().length > 0);
+	return blocks.map(block => {
+		const title = block.match(/^# (.+)/m)?.[1]?.trim() ?? "";
+		const url = block.match(/^URL: (.+)/m)?.[1]?.trim() ?? "";
+		return {
+			url,
+			title,
+			content: block.trim(),
+			error: null,
+		};
+	}).filter(item => item.url.length > 0 && item.content.length > 0);
+}
+
+async function buildCodeSearchFallback(
+	query: string,
+	maxTokens: number,
+	knownTools: string[] | null,
+	signal?: AbortSignal,
+): Promise<string> {
+	const tools = knownTools ?? await listExaMcpTools(signal).catch(() => []);
+	if (tools.length > 0 && !tools.includes("web_search_exa")) {
+		throw new Error(`Exa MCP code_search fallback unavailable. Available tools: ${tools.join(", ")}`);
+	}
+
+	const searchText = await callExaMcp(
+		"web_search_exa",
+		{
+			query: buildCodeSearchFallbackQuery(query),
+			numResults: 6,
+		},
+		signal,
+	);
+
+	const parsedResults = parseMcpResults(searchText) ?? [];
+	const urls = Array.from(new Set(parsedResults.map(result => result.url).filter(Boolean))).slice(0, CODE_SEARCH_FETCH_URL_LIMIT);
+	const targetChars = Math.min(Math.max(maxTokens * 4, 4000), 24000);
+	const sections = [
+		"Exa MCP fallback: assembled code context via web_search_exa/web_fetch_exa because get_code_context_exa is unavailable on the current Exa MCP server.",
+		`Query: ${query}`,
+		"",
+		"Search results:",
+		searchText.trim(),
+	];
+
+	if (urls.length > 0 && (tools.length === 0 || tools.includes("web_fetch_exa"))) {
+		try {
+			const fetchText = await callExaMcp(
+				"web_fetch_exa",
+				{
+					urls,
+					maxCharacters: Math.max(1500, Math.floor(targetChars / urls.length)),
+				},
+				signal,
+			);
+			if (fetchText.trim()) {
+				sections.push("", "Fetched source content:", fetchText.trim());
+			}
+		} catch (err) {
+			const message = err instanceof Error ? err.message : String(err);
+			sections.push("", `Note: web_fetch_exa fallback failed: ${message}`);
+		}
+	}
+
+	return truncateText(sections.join("\n"), targetChars);
+}
+
+export async function executeExaCodeSearch(
+	query: string,
+	maxTokens: number,
+	signal?: AbortSignal,
+): Promise<{ text: string; strategy: "get_code_context_exa" | "web_search_exa_fallback" }> {
+	let knownTools: string[] | null = null;
+	try {
+		knownTools = await listExaMcpTools(signal);
+	} catch {
+	}
+
+	if (!knownTools || knownTools.includes("get_code_context_exa")) {
+		try {
+			const text = await callExaMcp(
+				"get_code_context_exa",
+				{
+					query,
+					tokensNum: maxTokens,
+				},
+				signal,
+			);
+			return { text, strategy: "get_code_context_exa" };
+		} catch (err) {
+			const message = err instanceof Error ? err.message : String(err);
+			if (!isMissingExaMcpToolError(message)) {
+				throw err;
+			}
+			cachedMcpTools = null;
+			knownTools = await listExaMcpTools(signal).catch(() => null);
+		}
+	}
+
+	const text = await buildCodeSearchFallback(query, maxTokens, knownTools, signal);
+	return { text, strategy: "web_search_exa_fallback" };
+}
+
+export async function callExaMcp(
+	toolName: string,
+	args: Record<string, unknown>,
+	signal?: AbortSignal,
+): Promise<string> {
+	const knownTools = await listExaMcpTools(signal).catch(() => []);
+	if (knownTools.length > 0 && !knownTools.includes(toolName)) {
+		throw new Error(`Exa MCP tool unavailable: ${toolName}. Available tools: ${formatAvailableExaMcpTools(knownTools)}`);
+	}
+
+	const parsed = await exaMcpRpc("tools/call", {
+		name: toolName,
+		arguments: args,
+	}, signal);
 
 	if (parsed.result?.isError) {
 		const message = parsed.result.content
@@ -371,14 +536,16 @@ async function searchWithExaMcp(query: string, options: ExaSearchOptions = {}): 
 	const activityId = activityMonitor.logStart({ type: "api", query: enrichedQuery });
 
 	try {
+		const tools = await listExaMcpTools(options.signal).catch(() => []);
+		if (tools.length > 0 && !tools.includes("web_search_exa")) {
+			throw new Error(`Exa MCP tool unavailable: web_search_exa. Available tools: ${formatAvailableExaMcpTools(tools)}`);
+		}
+
 		const text = await callExaMcp(
 			"web_search_exa",
 			{
 				query: enrichedQuery,
 				numResults: options.numResults ?? 5,
-				livecrawl: "fallback",
-				type: "auto",
-				contextMaxCharacters: options.includeContent ? 50000 : 3000,
 			},
 			options.signal,
 		);
@@ -397,8 +564,32 @@ async function searchWithExaMcp(query: string, options: ExaSearchOptions = {}): 
 		};
 
 		if (options.includeContent) {
-			const inlineContent = mapMcpInlineContent(parsedResults);
-			if (inlineContent.length > 0) response.inlineContent = inlineContent;
+			const urls = Array.from(new Set(parsedResults.map(result => result.url).filter(Boolean))).slice(0, options.numResults ?? 5);
+			if (urls.length > 0 && (tools.length === 0 || tools.includes("web_fetch_exa"))) {
+				try {
+					const fetchText = await callExaMcp(
+						"web_fetch_exa",
+						{
+							urls,
+							maxCharacters: 50000,
+						},
+						options.signal,
+					);
+					const inlineContent = parseMcpFetchedContent(fetchText);
+					if (inlineContent.length > 0) {
+						response.inlineContent = inlineContent;
+					} else {
+						const partialInlineContent = mapMcpInlineContent(parsedResults);
+						if (partialInlineContent.length > 0) response.inlineContent = partialInlineContent;
+					}
+				} catch {
+					const partialInlineContent = mapMcpInlineContent(parsedResults);
+					if (partialInlineContent.length > 0) response.inlineContent = partialInlineContent;
+				}
+			} else {
+				const inlineContent = mapMcpInlineContent(parsedResults);
+				if (inlineContent.length > 0) response.inlineContent = inlineContent;
+			}
 		}
 
 		return response;

@@ -1,5 +1,5 @@
 import { activityMonitor } from "./activity.js";
-import { callExaMcp } from "./exa.js";
+import { executeExaCodeSearch } from "./exa.js";
 
 export async function executeCodeSearch(
 	_toolCallId: string,
@@ -7,7 +7,12 @@ export async function executeCodeSearch(
 	signal?: AbortSignal,
 ): Promise<{
 	content: Array<{ type: "text"; text: string }>;
-	details: { query: string; maxTokens: number; error?: string };
+	details: {
+		query: string;
+		maxTokens: number;
+		strategy?: "get_code_context_exa" | "web_search_exa_fallback";
+		error?: string;
+	};
 }> {
 	const query = params.query.trim();
 	if (!query) {
@@ -21,18 +26,11 @@ export async function executeCodeSearch(
 	const activityId = activityMonitor.logStart({ type: "api", query });
 
 	try {
-		const text = await callExaMcp(
-			"get_code_context_exa",
-			{
-				query,
-				tokensNum: maxTokens,
-			},
-			signal,
-		);
+		const { text, strategy } = await executeExaCodeSearch(query, maxTokens, signal);
 		activityMonitor.logComplete(activityId, 200);
 		return {
 			content: [{ type: "text", text }],
-			details: { query, maxTokens },
+			details: { query, maxTokens, strategy },
 		};
 	} catch (err) {
 		const message = err instanceof Error ? err.message : String(err);
