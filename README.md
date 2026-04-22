@@ -6,7 +6,7 @@
 
 **Web search, content extraction, and video understanding for Pi agent. Zero config with a supported Chromium-based browser, or bring your own API keys.**
 
-[![npm version](https://img.shields.io/npm/v/pi-web-access?style=for-the-badge)](https://www.npmjs.com/package/pi-web-access)
+[![npm version](https://img.shields.io/npm/v/%40jeonghyeon.net%2Fpi-web-access?style=for-the-badge)](https://www.npmjs.com/package/@jeonghyeon.net/pi-web-access)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg?style=for-the-badge)](https://opensource.org/licenses/MIT)
 [![Platform](https://img.shields.io/badge/Platform-macOS%20%7C%20Linux%20%7C%20Windows*-blue?style=for-the-badge)]()
 
@@ -25,7 +25,7 @@ https://github.com/user-attachments/assets/cac6a17a-1eeb-4dde-9818-cdf85d8ea98f
 ## Install
 
 ```bash
-pi install npm:pi-web-access
+pi install npm:@jeonghyeon.net/pi-web-access
 ```
 
 Works immediately with no API keys — Exa MCP provides zero-config search. For more providers or direct API access, add keys to `~/.pi/web-search.json`:
